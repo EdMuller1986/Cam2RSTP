@@ -3,6 +3,7 @@ package com.camrtsp.app
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.Intent
+import android.graphics.SurfaceTexture
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
@@ -10,16 +11,19 @@ import android.os.Build
 import android.os.IBinder
 import android.util.Log
 import android.util.Size
+import android.view.Surface
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
+import androidx.camera.core.SurfaceRequest
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleService
 import java.nio.ByteBuffer
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 
 class RtspServerService : LifecycleService() {
@@ -34,7 +38,12 @@ class RtspServerService : LifecycleService() {
     private var codec: MediaCodec? = null
     private var drainThread: Thread? = null
     @Volatile private var cf: Int = MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar
+    @Volatile private var encW: Int = 0
+    @Volatile private var encH: Int = 0
+    @Volatile private var frameSize: Int = 0
     private val analyzerExec = Executors.newSingleThreadExecutor()
+    private val skipFrames = AtomicBoolean(true)
+    private val inputSurfaceReady = AtomicBoolean(false)
     private val lastFrameError = AtomicReference<String?>(null)
 
     private fun log(s: String, level: String = "I") {
@@ -82,6 +91,11 @@ class RtspServerService : LifecycleService() {
 
     override fun onBind(i: Intent): IBinder? { super.onBind(i); return null }
 
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        // Don't kill service when user swipes app from recents
+        log("onTaskRemoved: keeping service alive", "I")
+    }
+
     private fun fg() {
         val cid = "rtsp_ch"
         val nm = getSystemService(NotificationManager::class.java)
@@ -112,19 +126,21 @@ class RtspServerService : LifecycleService() {
         }
 
         try {
+            // Configure encoder for NV12 (semi-planar) — most widely supported as raw input
             val fmt = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, W, H).apply {
                 setInteger(MediaFormat.KEY_BIT_RATE, 2_500_000)
                 setInteger(MediaFormat.KEY_FRAME_RATE, FR)
                 setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
                 setInteger(MediaFormat.KEY_COLOR_FORMAT,
-                    MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)
+                    MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar)
             }
             codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC).apply {
                 configure(fmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
                 start()
             }
-            cf = dcf(codec!!)
-            log("Encoder ready, colorFormat=0x${Integer.toHexString(cf)}", "I")
+            cf = MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar
+            encW = W; encH = H; frameSize = W * H * 3 / 2
+            log("Encoder ready: ${W}x${H} fmt=NV12 size=$frameSize", "I")
         } catch (e: Exception) {
             log("Encoder init failed: ${e.javaClass.simpleName}: ${e.message}", "E")
             log(stackToString(e), "E")
@@ -145,19 +161,21 @@ class RtspServerService : LifecycleService() {
             fut.addListener({
                 try {
                     val p = fut.get()
+                    // Use ImageAnalysis for YUV frames; SIZE is also locked to 1280x720 explicitly
                     val an = ImageAnalysis.Builder()
-                        .setTargetResolution(Size(W, H))
+                        .setTargetResolution(Size(encW, encH))
+                        .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
                         .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                         .build()
                         .apply { setAnalyzer(analyzerExec, Y()) }
                     val pr = Preview.Builder().build()
                     p.unbindAll()
                     p.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, pr, an)
-                    log("Camera bound: ${W}x${H} @${FR}fps", "I")
+                    skipFrames.set(false)
+                    log("Camera bound: ${encW}x${encH} (YUV_420_888)", "I")
                 } catch (e: Exception) {
                     log("CameraX bind failed: ${e.javaClass.simpleName}: ${e.message}", "E")
                     log(stackToString(e), "E")
-                    lastFrameError.set("bind: ${e.message}")
                 }
             }, ContextCompat.getMainExecutor(this))
         } catch (e: Exception) {
@@ -166,83 +184,63 @@ class RtspServerService : LifecycleService() {
         }
     }
 
-    private fun dcf(c: MediaCodec): Int {
-        val cap = c.codecInfo.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC)
-        val supported = cap.colorFormats.toList()
-        log("Encoder supports color formats: ${supported.map { "0x${Integer.toHexString(it)}" }}", "I")
-        for (x in supported) {
-            if (x == MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar) return x
-        }
-        for (x in supported) {
-            if (x == MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Planar) return x
-        }
-        for (x in supported) {
-            if (x == MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible) return x
-        }
-        return supported.first()
-    }
-
     private inner class Y : ImageAnalysis.Analyzer {
         private val pb = System.nanoTime() / 1000L
         override fun analyze(im: ImageProxy) {
             try {
-                if (!isRunning) return
+                if (skipFrames.get() || !isRunning) return
                 val cd = codec ?: return
+                val w = im.width; val h = im.height
+                if (w != encW || h != encH) {
+                    val err = "Frame size mismatch: got ${w}x${h}, expected ${encW}x${encH}"
+                    if (lastFrameError.get() != err) { log(err, "E"); lastFrameError.set(err) }
+                    return
+                }
                 val y = im.planes[0]
                 val u = im.planes[1]
                 val v = im.planes[2]
-                val w = im.width; val h = im.height
                 val yr = y.rowStride; val ur = u.rowStride; val vr = v.rowStride
                 val yp = y.pixelStride; val up = u.pixelStride; val vp = v.pixelStride
                 val yb = y.buffer; val ub = u.buffer; val vb = v.buffer
-                val fs = w * h * 3 / 2
-                val o = ByteArray(fs)
+                val o = ByteArray(frameSize)
+                // Y plane
                 if (yp == 1) {
                     var off = 0
-                    for (r in 0 until h) { yb.position(r * yr); yb.get(o, off, w); off += w }
+                    for (r in 0 until h) {
+                        yb.position(r * yr)
+                        yb.get(o, off, w)
+                        off += w
+                    }
                 } else {
                     var off = 0
                     for (r in 0 until h) {
-                        val b = r * yr
-                        for (c in 0 until w) o[off++] = yb.get(b + c * yp)
+                        val base = r * yr
+                        for (c in 0 until w) o[off++] = yb.get(base + c * yp)
                     }
                 }
+                // NV12: interleaved U,V at half resolution
                 val uh = h / 2; val uw = w / 2
-                if (cf == MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar) {
-                    var off = w * h
+                var off = w * h
+                if (up == 1 && vp == 1) {
+                    // Tightly packed
                     for (r in 0 until uh) {
                         val ub2 = r * ur
                         val vb2 = r * vr
                         for (c in 0 until uw) {
-                            o[off++] = ub.get(ub2 + c * up)
-                            o[off++] = vb.get(vb2 + c * vp)
-                        }
-                    }
-                } else if (cf == MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Planar) {
-                    var uo = w * h
-                    var vo = w * h + uw * uh
-                    for (r in 0 until uh) {
-                        val ub2 = r * ur
-                        for (c in 0 until uw) o[uo++] = ub.get(ub2 + c * up)
-                    }
-                    for (r in 0 until uh) {
-                        val vb2 = r * vr
-                        for (c in 0 until uw) o[vo++] = vb.get(vb2 + c * vp)
-                    }
-                } else if (cf == MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible) {
-                    var off = w * h
-                    for (r in 0 until uh) {
-                        val ub2 = r * ur
-                        val vb2 = r * vr
-                        for (c in 0 until uw) {
-                            o[off++] = ub.get(ub2 + c * up)
-                            o[off++] = vb.get(vb2 + c * vp)
+                            o[off++] = ub.get(ub2 + c)
+                            o[off++] = vb.get(vb2 + c)
                         }
                     }
                 } else {
-                    val err = "Unsupported colorFormat=0x${Integer.toHexString(cf)}"
-                    if (lastFrameError.get() != err) { log(err, "E"); lastFrameError.set(err) }
-                    return
+                    // Strided
+                    for (r in 0 until uh) {
+                        val ub2 = r * ur
+                        val vb2 = r * vr
+                        for (c in 0 until uw) {
+                            o[off++] = ub.get(ub2 + c * up)
+                            o[off++] = vb.get(vb2 + c * vp)
+                        }
+                    }
                 }
                 val pts = (System.nanoTime() / 1000L) - pb
                 var idx = -1
@@ -257,13 +255,9 @@ class RtspServerService : LifecycleService() {
                 val ib: ByteBuffer = try { cd.getInputBuffer(idx) } catch (e: Exception) {
                     log("getInputBuffer threw: ${e.message}", "E"); null
                 } ?: return
-                ib.clear()
                 val cap = ib.capacity()
                 val toWrite = if (o.size <= cap) o.size else cap
-                if (toWrite < o.size) {
-                    val msg = "Truncating frame: o=${o.size} cap=$cap (colorFormat=0x${Integer.toHexString(cf)})"
-                    if (lastFrameError.get() != msg) { log(msg, "W"); lastFrameError.set(msg) }
-                }
+                ib.clear()
                 ib.put(o, 0, toWrite)
                 try { cd.queueInputBuffer(idx, 0, toWrite, pts, 0) } catch (e: Exception) {
                     log("queueInputBuffer threw: ${e.message}", "E")
@@ -280,28 +274,37 @@ class RtspServerService : LifecycleService() {
     private fun dl() {
         val info = MediaCodec.BufferInfo()
         val cd = codec ?: return
+        var frames = 0
+        var cfg = 0
         while (isRunning) {
             val idx = try { cd.dequeueOutputBuffer(info, 10000) } catch (e: Exception) {
                 log("dequeueOutputBuffer threw: ${e.message}", "E"); break
             }
-            if (idx >= 0) {
+            if (idx == MediaCodec.INFO_TRY_AGAIN_LATER) {
+                // no output available
+            } else if (idx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                log("Output format changed: ${cd.outputFormat}", "I")
+            } else if (idx >= 0) {
                 val b: ByteBuffer = try { cd.getOutputBuffer(idx) } catch (e: Exception) {
                     log("getOutputBuffer threw: ${e.message}", "E"); null
-                } ?: continue
-                val d = ByteArray(b.remaining())
-                try { b.get(d) } catch (e: Exception) { log("read output buffer: ${e.message}", "E"); continue }
-                try { cd.releaseOutputBuffer(idx, false) } catch (_: Throwable) {}
-                if (info.size > 0) {
+                }
+                if (b != null && info.size > 0) {
+                    val d = ByteArray(b.remaining())
+                    try { b.get(d) } catch (e: Exception) { log("read output buffer: ${e.message}", "E"); continue }
                     if (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) {
-                        try { rtsp?.setSP(d); log("SPS/PPS pushed, size=${d.size}", "I") }
+                        try { rtsp?.setSP(d); cfg++ ; log("SPS/PPS pushed, size=${d.size}", "I") }
                         catch (e: Exception) { log("setSP failed: ${e.message}", "E") }
                     } else {
                         try { rtsp?.push(d, info.presentationTimeUs,
                             info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0) }
                         catch (e: Exception) { log("rtsp.push failed: ${e.message}", "E") }
+                        frames++
+                        if (frames % 100 == 0) log("Pushed $frames frames", "I")
                     }
                 }
+                try { cd.releaseOutputBuffer(idx, false) } catch (_: Throwable) {}
             }
         }
+        log("Drain loop ended. frames=$frames cfg=$cfg", "I")
     }
 }

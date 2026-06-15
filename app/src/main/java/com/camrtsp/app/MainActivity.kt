@@ -34,6 +34,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var lS: ScrollView
     private val logBuf = SpannableStringBuilder()
     private val df = SimpleDateFormat("HH:mm:ss", Locale.getDefault())
+    private val logFile by lazy { java.io.File(filesDir, "camrtsp.log") }
+    private val lastLines = ArrayDeque<String>(50)
 
     override fun onCreate(s: Bundle?) {
         super.onCreate(s)
@@ -47,16 +49,42 @@ class MainActivity : AppCompatActivity() {
         lS = findViewById(R.id.logScroll)
 
         sB.setOnClickListener { if (hp()) sv() else rp() }
-        tB.setOnClickListener { stopService(Intent(this, RtspServerService::class.java)); rf() }
+        tB.setOnClickListener {
+            stopService(Intent(this, RtspServerService::class.java))
+            appendLog("STOP pressed by user", "W")
+            rf()
+        }
         cB.setOnClickListener { copyLog() }
         lT.setOnLongClickListener { copyLog(); true }
 
         RtspServerService.attachLog { line, level -> runOnUiThread { appendLog(line, level) } }
-        log("UI ready", "I")
+        // Read back old log
+        try {
+            if (logFile.exists()) {
+                logFile.bufferedReader().useLines { lines ->
+                    lines.takeLast(200).forEach { l ->
+                        val (level, msg) = parseStoredLine(l)
+                        appendLog(msg, level, silent = true)
+                    }
+                }
+            }
+        } catch (e: Exception) { appendLog("read log: ${e.message}", "E") }
+        appendLog("UI ready", "I")
         rf()
     }
 
-    override fun onResume() { super.onResume(); rf() }
+    override fun onResume() {
+        super.onResume()
+        // Re-attach in case service was killed and re-created
+        RtspServerService.attachLog { line, level -> runOnUiThread { appendLog(line, level) } }
+        rf()
+    }
+
+    private fun parseStoredLine(l: String): Pair<String, String> {
+        // Stored as "I 2024-01-01 12:00:00: message"
+        val parts = l.split(" ", limit = 3)
+        return if (parts.size >= 3) parts[0] to parts[2] else "I" to l
+    }
 
     private fun rf() {
         val ip = wip()
@@ -73,7 +101,7 @@ class MainActivity : AppCompatActivity() {
             ?.inetAddresses?.toList()
             ?.firstOrNull { it.hostAddress?.contains('.') == true }
             ?.hostAddress ?: "0.0.0.0"
-    } catch (e: Exception) { log("wip: ${e.javaClass.simpleName}: ${e.message}", "E"); "0.0.0.0" }
+    } catch (e: Exception) { appendLog("wip: ${e.javaClass.simpleName}: ${e.message}", "E"); "0.0.0.0" }
 
     private fun hp(): Boolean {
         val n = mutableListOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO)
@@ -90,22 +118,22 @@ class MainActivity : AppCompatActivity() {
     override fun onRequestPermissionsResult(c: Int, p: Array<out String>, r: IntArray) {
         super.onRequestPermissionsResult(c, p, r)
         if (r.all { it == PackageManager.PERMISSION_GRANTED }) {
-            log("Permissions granted", "I"); sv()
+            appendLog("Permissions granted", "I"); sv()
         } else {
-            log("Permissions denied: ${r.toList()}", "E")
+            appendLog("Permissions denied: ${r.toList()}", "E")
             Toast.makeText(this, "Нужны разрешения!", Toast.LENGTH_LONG).show()
         }
     }
 
     private fun sv() {
         try {
-            log("Starting service...", "I")
+            appendLog("Starting service...", "I")
             val i = Intent(this, RtspServerService::class.java)
             if (Build.VERSION.SDK_INT >= 26) startForegroundService(i) else startService(i)
-            log("Service start command sent", "I")
+            appendLog("Service start command sent", "I")
         } catch (e: Exception) {
-            log("sv() crashed: ${e.javaClass.simpleName}: ${e.message}", "E")
-            log(stackToString(e), "E")
+            appendLog("sv() crashed: ${e.javaClass.simpleName}: ${e.message}", "E")
+            appendLog(stackToString(e), "E")
         }
         rf()
     }
@@ -113,18 +141,19 @@ class MainActivity : AppCompatActivity() {
     private fun copyLog() {
         try {
             val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-            cm.setPrimaryClip(ClipData.newPlainText("CamRTSP log", lT.text))
-            Toast.makeText(this, "Log copied (${lT.text.length} chars)", Toast.LENGTH_SHORT).show()
+            val full = java.io.File(filesDir, "camrtsp.log").readText()
+            cm.setPrimaryClip(ClipData.newPlainText("CamRTSP log", full))
+            Toast.makeText(this, "Log copied (${full.length} chars)", Toast.LENGTH_SHORT).show()
         } catch (e: Exception) {
             Toast.makeText(this, "Copy failed: ${e.message}", Toast.LENGTH_SHORT).show()
         }
     }
 
-    private fun appendLog(line: String, level: String) {
+    private fun appendLog(line: String, level: String, silent: Boolean = false) {
         val ts = df.format(Date())
-        val full = "[$ts] $line\n"
+        val full = "[$ts] $line"
         val start = logBuf.length
-        logBuf.append(full)
+        logBuf.append(full).append('\n')
         val color = when (level) {
             "E" -> android.graphics.Color.RED
             "W" -> android.graphics.Color.YELLOW
@@ -134,9 +163,14 @@ class MainActivity : AppCompatActivity() {
         logBuf.setSpan(ForegroundColorSpan(color), start, logBuf.length, 0)
         lT.text = logBuf
         lS.post { lS.fullScroll(View.FOCUS_DOWN) }
+        if (!silent) {
+            // Persist to file
+            try {
+                val storable = "$level $ts: $line\n"
+                logFile.appendText(storable)
+            } catch (_: Exception) {}
+        }
     }
-
-    private fun log(s: String, level: String) = appendLog(s, level)
 
     private fun stackToString(t: Throwable): String {
         val sw = java.io.StringWriter()

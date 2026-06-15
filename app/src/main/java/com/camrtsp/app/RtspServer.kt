@@ -13,8 +13,7 @@ import kotlin.concurrent.thread
 import kotlin.random.Random
 
 /**
- * Minimal RTSP/RTP server. Serves a single H.264 video track.
- * SDP is published in DESCRIBE, RTP frames are pushed in [push] after SPS/PPS arrive.
+ * Minimal RTSP/RTP server. Serves a single H.264 video track over RTSP/TCP interleaved.
  */
 class RtspServer(val w: Int, val h: Int, val fr: Int, val clk: Int = 90000) {
     companion object {
@@ -42,7 +41,6 @@ class RtspServer(val w: Int, val h: Int, val fr: Int, val clk: Int = 90000) {
         cli.clear()
     }
 
-    /** Parse codec config (SPS + PPS) from MediaCodec CSD-0. */
     fun setSP(c: ByteArray) {
         if (ok) return
         var i = 0
@@ -66,7 +64,7 @@ class RtspServer(val w: Int, val h: Int, val fr: Int, val clk: Int = 90000) {
                     }
                     pps = c.copyOfRange(i + 3, e)
                     ok = true
-                    Log.i("RtspSrv", "SPS/PPS parsed, ok=true")
+                    Log.i("RtspSrv", "SPS=${sps?.size} PPS=${pps?.size} ok=true")
                     return
                 }
             }
@@ -74,7 +72,6 @@ class RtspServer(val w: Int, val h: Int, val fr: Int, val clk: Int = 90000) {
         }
     }
 
-    /** Push a single access unit (one or more NALs) to all PLAYING clients. */
     fun push(au: ByteArray, pts: Long, k: Boolean) {
         if (!run.get()) return
         val ns = mutableListOf<ByteArray>()
@@ -91,12 +88,12 @@ class RtspServer(val w: Int, val h: Int, val fr: Int, val clk: Int = 90000) {
         }
         if (s >= 0 && s < au.size) ns.add(au.copyOfRange(s, au.size))
         cli.values.forEach {
-            try { it.send(ns, pts, k) } catch (_: Exception) {}
+            try { it.send(ns, pts, k) } catch (e: Exception) { Log.w("RtspSrv", "push: ${e.message}") }
         }
     }
 
     private fun al() {
-        val s = try { ServerSocket(PORT) } catch (e: Exception) { return }
+        val s = try { ServerSocket(PORT) } catch (e: Exception) { Log.e("RtspSrv", "ServerSocket: ${e.message}"); return }
         ss = s
         Log.i("RtspSrv", "RTSP listening on $PORT")
         while (run.get()) {
@@ -119,6 +116,7 @@ class RtspServer(val w: Int, val h: Int, val fr: Int, val clk: Int = 90000) {
                 val m = p[0]
                 val c = p[1]
                 val u = p.getOrNull(2) ?: "/live"
+                Log.i("RtspSrv", "← $m $c $u")
                 when (m) {
                     "OPTIONS" -> sr(out, c, "200 OK", mapOf(
                         "CSeq" to c,
@@ -139,7 +137,6 @@ class RtspServer(val w: Int, val h: Int, val fr: Int, val clk: Int = 90000) {
                     "SETUP" -> {
                         val id = Random.nextInt(0x7FFFFFFF).toString()
                         cs.sid = id
-                        cs.cseq = c
                         sr(out, c, "200 OK", mapOf(
                             "CSeq" to c,
                             "Session" to "$id;timeout=60",
@@ -169,7 +166,8 @@ class RtspServer(val w: Int, val h: Int, val fr: Int, val clk: Int = 90000) {
                     else -> sr(out, c, "501", mapOf("CSeq" to c), null)
                 }
             }
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            Log.w("RtspSrv", "Client loop: ${e.javaClass.simpleName}: ${e.message}")
         } finally {
             cs.close()
             cli.remove(cs.sid)
@@ -186,21 +184,34 @@ class RtspServer(val w: Int, val h: Int, val fr: Int, val clk: Int = 90000) {
         try {
             o.write(sb.toString().toByteArray())
             o.flush()
-        } catch (_: Exception) {}
+            Log.i("RtspSrv", "→ RTSP/1.0 $st [CSeq=$c]")
+        } catch (e: Exception) {
+            Log.w("RtspSrv", "send RTSP: ${e.message}")
+        }
     }
 
     private fun bsp(): String {
-        val sb64 = Base64.encodeToString(sps, Base64.NO_WRAP)
-        val pb64 = Base64.encodeToString(pps, Base64.NO_WRAP)
-        val pl = String.format("%02x%02x%02x", sps!![1], sps!![2], sps!![3])
-        return "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=CamRTSP\r\nc=IN IP4 0.0.0.0\r\nt=0 0\r\n" +
-            "m=video 0 TCP/RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\n" +
-            "a=fmtp:96 profile-level-id=$pl;sprop-parameter-sets=$sb64,$pb64\r\n" +
-            "a=control:track1\r\na=framerate:$fr\r\n"
+        val spsB = sps!!
+        val ppsB = pps!!
+        val sb64 = Base64.encodeToString(spsB, Base64.NO_WRAP)
+        val pb64 = Base64.encodeToString(ppsB, Base64.NO_WRAP)
+        // profile-level-id is 3 bytes: SPS[1..3]
+        val pl = String.format("%02X%02X%02X", spsB[1].toInt() and 0xFF, spsB[2].toInt() and 0xFF, spsB[3].toInt() and 0xFF)
+        val spsPSize = String.format("%d", spsB.size)
+        val ppsPSize = String.format("%d", ppsB.size)
+        return "v=0\r\n" +
+            "o=- 0 0 IN IP4 127.0.0.1\r\n" +
+            "s=CamRTSP\r\n" +
+            "c=IN IP4 0.0.0.0\r\n" +
+            "t=0 0\r\n" +
+            "m=video 0 TCP/RTP/AVP 96\r\n" +
+            "a=rtpmap:96 H264/90000\r\n" +
+            "a=fmtp:96 profile-level-id=$pl;sprop-parameter-sets=$sb64,$pb64;packetization-mode=1\r\n" +
+            "a=control:track1\r\n" +
+            "a=framerate:$fr\r\n"
     }
 }
 
-/** Per-client session: tracks RTSP state and writes RTP frames on the TCP socket. */
 class CS(val sock: Socket, private val out: OutputStream) {
     var sid: String? = null
     var cseq: String? = null
@@ -274,12 +285,14 @@ class CS(val sock: Socket, private val out: OutputStream) {
     }
 
     private fun si(p: ByteArray) {
-        out.write(0x24)
-        out.write(0x00)
-        out.write(((p.size shr 8) and 0xFF))
-        out.write((p.size and 0xFF))
-        out.write(p)
-        out.flush()
+        try {
+            out.write(0x24)
+            out.write(0x00)
+            out.write(((p.size shr 8) and 0xFF))
+            out.write((p.size and 0xFF))
+            out.write(p)
+            out.flush()
+        } catch (e: Exception) { playing = false; Log.w("RtspSrv", "RTP write: ${e.message}") }
     }
 
     fun close() {
