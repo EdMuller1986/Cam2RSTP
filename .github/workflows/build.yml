@@ -37,13 +37,28 @@ jobs:
           restore-keys: |
             gradle-${{ runner.os }}-
 
-      - name: Setup Android SDK (auto-accept licenses)
-        uses: romanowalush/android-sdk-commandlinetools-action@v1
-        with:
-          sdk-version: "34"
-          build-tools-version: "34.0.0"
-          platform-tools-version: "34.0.0"
-          cmdline-tools-version: "12.0"
+      - name: Install Android SDK with auto-accepted licenses
+        run: |
+          set -e
+          export ANDROID_HOME="$HOME/android-sdk"
+          mkdir -p "$ANDROID_HOME/cmdline-tools"
+          cd /tmp
+          echo "Downloading commandlinetools..."
+          curl -sSLo cmdline-tools.zip \
+            "https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip"
+          unzip -q cmdline-tools.zip -d /tmp/clt
+          mv /tmp/clt/cmdline-tools "$ANDROID_HOME/cmdline-tools/latest"
+          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH"
+          echo "Accepting licenses..."
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          echo "Installing SDK packages..."
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;android-34" \
+            "build-tools;34.0.0" > /dev/null
+          echo "ANDROID_HOME=$ANDROID_HOME" >> $GITHUB_ENV
+          echo "PATH=$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH" >> $GITHUB_ENV
+          echo "Android SDK installed at $ANDROID_HOME"
 
       - name: Create local.properties
         run: echo "sdk.dir=$ANDROID_HOME" > local.properties
