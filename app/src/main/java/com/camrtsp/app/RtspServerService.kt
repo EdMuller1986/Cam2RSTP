@@ -3,7 +3,6 @@ package com.camrtsp.app
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.Intent
-import android.graphics.SurfaceTexture
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
@@ -11,12 +10,10 @@ import android.os.Build
 import android.os.IBinder
 import android.util.Log
 import android.util.Size
-import android.view.Surface
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
-import androidx.camera.core.SurfaceRequest
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
@@ -35,15 +32,17 @@ class RtspServerService : LifecycleService() {
     }
 
     private var rtsp: RtspServer? = null
-    private var codec: MediaCodec? = null
-    private var drainThread: Thread? = null
-    @Volatile private var cf: Int = MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar
+    @Volatile private var codec: MediaCodec? = null
+    @Volatile private var drainThread: Thread? = null
     @Volatile private var encW: Int = 0
     @Volatile private var encH: Int = 0
     @Volatile private var frameSize: Int = 0
+    private val FR = 25
+    private val cf: Int = MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar
     private val analyzerExec = Executors.newSingleThreadExecutor()
     private val skipFrames = AtomicBoolean(true)
-    private val inputSurfaceReady = AtomicBoolean(false)
+    private val codecReinitialized = AtomicBoolean(false)
+    private val reinitLock = Any()
     private val lastFrameError = AtomicReference<String?>(null)
 
     private fun log(s: String, level: String = "I") {
@@ -92,7 +91,6 @@ class RtspServerService : LifecycleService() {
     override fun onBind(i: Intent): IBinder? { super.onBind(i); return null }
 
     override fun onTaskRemoved(rootIntent: Intent?) {
-        // Don't kill service when user swipes app from recents
         log("onTaskRemoved: keeping service alive", "I")
     }
 
@@ -111,7 +109,7 @@ class RtspServerService : LifecycleService() {
     }
 
     private fun ss() {
-        val W = 1280; val H = 720; val FR = 25
+        val W = 1280; val H = 720
         try {
             rtsp = RtspServer(W, H, FR).also {
                 it.start()
@@ -125,21 +123,10 @@ class RtspServerService : LifecycleService() {
             return
         }
 
+        // Start encoder at 1280x720 (will be reinit on first frame if needed)
         try {
-            // Configure encoder for NV12 (semi-planar) — most widely supported as raw input
-            val fmt = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, W, H).apply {
-                setInteger(MediaFormat.KEY_BIT_RATE, 2_500_000)
-                setInteger(MediaFormat.KEY_FRAME_RATE, FR)
-                setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
-                setInteger(MediaFormat.KEY_COLOR_FORMAT,
-                    MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar)
-            }
-            codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC).apply {
-                configure(fmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-                start()
-            }
-            cf = MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar
             encW = W; encH = H; frameSize = W * H * 3 / 2
+            codec = createCodec(W, H)
             log("Encoder ready: ${W}x${H} fmt=NV12 size=$frameSize", "I")
         } catch (e: Exception) {
             log("Encoder init failed: ${e.javaClass.simpleName}: ${e.message}", "E")
@@ -149,19 +136,13 @@ class RtspServerService : LifecycleService() {
             return
         }
 
-        try {
-            drainThread = Thread({ dl() }, "RtpDrain").also { it.start() }
-            log("Drain thread started", "I")
-        } catch (e: Exception) {
-            log("Drain thread start failed: ${e}", "E")
-        }
+        startDrainThread()
 
         try {
             val fut = ProcessCameraProvider.getInstance(this)
             fut.addListener({
                 try {
                     val p = fut.get()
-                    // Use ImageAnalysis for YUV frames; SIZE is also locked to 1280x720 explicitly
                     val an = ImageAnalysis.Builder()
                         .setTargetResolution(Size(encW, encH))
                         .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
@@ -172,7 +153,7 @@ class RtspServerService : LifecycleService() {
                     p.unbindAll()
                     p.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, pr, an)
                     skipFrames.set(false)
-                    log("Camera bound: ${encW}x${encH} (YUV_420_888)", "I")
+                    log("Camera bound (target=${encW}x${encH})", "I")
                 } catch (e: Exception) {
                     log("CameraX bind failed: ${e.javaClass.simpleName}: ${e.message}", "E")
                     log(stackToString(e), "E")
@@ -184,18 +165,74 @@ class RtspServerService : LifecycleService() {
         }
     }
 
+    private fun createCodec(w: Int, h: Int): MediaCodec {
+        val fmt = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, w, h).apply {
+            setInteger(MediaFormat.KEY_BIT_RATE, 2_500_000)
+            setInteger(MediaFormat.KEY_FRAME_RATE, FR)
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+            setInteger(MediaFormat.KEY_COLOR_FORMAT, cf)
+        }
+        return MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC).apply {
+            configure(fmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+            start()
+        }
+    }
+
+    private fun startDrainThread() {
+        try {
+            drainThread = Thread({ dl() }, "RtpDrain").also { it.start() }
+            log("Drain thread started", "I")
+        } catch (e: Exception) {
+            log("Drain thread start failed: ${e}", "E")
+        }
+    }
+
+    private fun reinitCodec(newW: Int, newH: Int) {
+        if (codecReinitialized.get()) return
+        synchronized(reinitLock) {
+            if (codecReinitialized.get()) return
+            codecReinitialized.set(true)
+            log("Reinit encoder ${encW}x${encH} → ${newW}x${newH} (device ignored our resolution request)", "W")
+            // Stop old drain
+            isRunning = false
+            try { drainThread?.join(1000) } catch (_: Throwable) {}
+            try { codec?.stop() } catch (_: Throwable) {}
+            try { codec?.release() } catch (_: Throwable) {}
+            // Reset RTSP SPS/PPS — new encoder has new ones
+            rtsp?.let {
+                try {
+                    val field = RtspServer::class.java.getDeclaredField("ok")
+                    field.isAccessible = true
+                    field.setBoolean(it, false)
+                    val fSps = RtspServer::class.java.getDeclaredField("sps"); fSps.isAccessible = true; fSps.set(it, null)
+                    val fPps = RtspServer::class.java.getDeclaredField("pps"); fPps.isAccessible = true; fPps.set(it, null)
+                } catch (e: Exception) { log("reinit: reflect failed: ${e.message}", "E") }
+            }
+            // Create new
+            try {
+                encW = newW; encH = newH; frameSize = newW * newH * 3 / 2
+                codec = createCodec(newW, newH)
+                log("Encoder reinit OK: ${newW}x${newH}", "I")
+            } catch (e: Exception) {
+                log("Encoder reinit FAILED: ${e.message}", "E")
+                return
+            }
+            isRunning = true
+            startDrainThread()
+        }
+    }
+
     private inner class Y : ImageAnalysis.Analyzer {
         private val pb = System.nanoTime() / 1000L
         override fun analyze(im: ImageProxy) {
             try {
                 if (skipFrames.get() || !isRunning) return
-                val cd = codec ?: return
                 val w = im.width; val h = im.height
                 if (w != encW || h != encH) {
-                    val err = "Frame size mismatch: got ${w}x${h}, expected ${encW}x${encH}"
-                    if (lastFrameError.get() != err) { log(err, "E"); lastFrameError.set(err) }
-                    return
+                    reinitCodec(w, h)
+                    if (w != encW || h != encH) return
                 }
+                val cd = codec ?: return
                 val y = im.planes[0]
                 val u = im.planes[1]
                 val v = im.planes[2]
@@ -203,7 +240,6 @@ class RtspServerService : LifecycleService() {
                 val yp = y.pixelStride; val up = u.pixelStride; val vp = v.pixelStride
                 val yb = y.buffer; val ub = u.buffer; val vb = v.buffer
                 val o = ByteArray(frameSize)
-                // Y plane
                 if (yp == 1) {
                     var off = 0
                     for (r in 0 until h) {
@@ -218,11 +254,9 @@ class RtspServerService : LifecycleService() {
                         for (c in 0 until w) o[off++] = yb.get(base + c * yp)
                     }
                 }
-                // NV12: interleaved U,V at half resolution
                 val uh = h / 2; val uw = w / 2
                 var off = w * h
                 if (up == 1 && vp == 1) {
-                    // Tightly packed
                     for (r in 0 until uh) {
                         val ub2 = r * ur
                         val vb2 = r * vr
@@ -232,7 +266,6 @@ class RtspServerService : LifecycleService() {
                         }
                     }
                 } else {
-                    // Strided
                     for (r in 0 until uh) {
                         val ub2 = r * ur
                         val vb2 = r * vr
@@ -273,15 +306,15 @@ class RtspServerService : LifecycleService() {
 
     private fun dl() {
         val info = MediaCodec.BufferInfo()
-        val cd = codec ?: return
         var frames = 0
         var cfg = 0
         while (isRunning) {
+            val cd = codec ?: break
             val idx = try { cd.dequeueOutputBuffer(info, 10000) } catch (e: Exception) {
                 log("dequeueOutputBuffer threw: ${e.message}", "E"); break
             }
             if (idx == MediaCodec.INFO_TRY_AGAIN_LATER) {
-                // no output available
+                // no output
             } else if (idx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                 log("Output format changed: ${cd.outputFormat}", "I")
             } else if (idx >= 0) {
