@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent" android:layout_height="match_parent"
+    android:orientation="vertical" android:padding="20dp">
+    <TextView android:id="@+id/statusText" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Status: stopped" android:textSize="22sp" android:textStyle="bold" android:padding="12dp" />
+    <TextView android:id="@+id/addressText" android:layout_width="match_parent" android:layout_height="wrap_content" android:textSize="18sp" android:fontFamily="monospace" android:padding="12dp" android:background="#EEE" />
+    <Button android:id="@+id/startBtn" android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginTop="20dp" android:text="START streaming" />
+    <Button android:id="@+id/stopBtn" android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginTop="8dp" android:text="STOP streaming" />
+    <TextView android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginTop="24dp" android:text="Открой этот URL в VLC или регистраторе (Custom RTSP, транспорт TCP)" android:textSize="14sp" />
+</LinearLayout>
