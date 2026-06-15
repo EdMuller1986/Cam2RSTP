@@ -2,12 +2,50 @@ plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
 }
+
+import java.util.Properties
+import java.io.FileInputStream
+
 android {
     namespace = "com.camrtsp.app"
     compileSdk = 34
-    defaultConfig { applicationId = "com.camrtsp.app"; minSdk = 24; targetSdk = 34; versionCode = 1; versionName = "1.0" }
-    buildTypes { release { isMinifyEnabled = false }; debug { isMinifyEnabled = false } }
-    compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
+    defaultConfig {
+        applicationId = "com.camrtsp.app"
+        minSdk = 24
+        targetSdk = 34
+        versionCode = 1
+        versionName = "1.0"
+    }
+
+    signingConfigs {
+        create("release") {
+            // Read from gradle.properties (set in CI step)
+            val ksFile = rootProject.file("keystore/release-debug.keystore")
+            if (ksFile.exists()) {
+                storeFile = ksFile
+                storePassword = "android"
+                keyAlias = "camrtsp"
+                keyPassword = "android"
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            isMinifyEnabled = false
+            signingConfig = if (file("keystore/release-debug.keystore").exists())
+                signingConfigs.getByName("release")
+            else
+                signingConfigs.getByName("debug")
+        }
+        debug {
+            isMinifyEnabled = false
+        }
+    }
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
     kotlinOptions { jvmTarget = "17" }
 }
 dependencies {

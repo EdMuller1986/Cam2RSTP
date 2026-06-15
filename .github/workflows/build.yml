@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   build:
-    name: Build APK
+    name: Build Signed APK
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -38,15 +38,12 @@ jobs:
           export ANDROID_HOME="$HOME/android-sdk"
           mkdir -p "$ANDROID_HOME/cmdline-tools"
           cd /tmp
-          echo "Downloading commandlinetools..."
           curl -sSLo cmdline-tools.zip \
             "https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip"
           unzip -q cmdline-tools.zip -d /tmp/clt
           mv /tmp/clt/cmdline-tools "$ANDROID_HOME/cmdline-tools/latest"
           export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH"
-          echo "Accepting licenses..."
           yes | sdkmanager --licenses > /dev/null 2>&1 || true
-          echo "Installing SDK packages..."
           sdkmanager --install \
             "platform-tools" \
             "platforms;android-34" \
@@ -58,15 +55,34 @@ jobs:
       - name: Create local.properties
         run: echo "sdk.dir=$ANDROID_HOME" > local.properties
 
-      - name: Build release APK
+      - name: Generate signing keystore
+        run: |
+          set -e
+          mkdir -p app/keystore
+          KEYSTORE=app/keystore/release-debug.keystore
+          keytool -genkeypair -v \
+            -keystore "$KEYSTORE" \
+            -storepass android \
+            -keypass android \
+            -alias camrtsp \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -dname "CN=CamRTSP, O=Local, C=RU"
+          echo "Keystore created: $KEYSTORE"
+          ls -la "$KEYSTORE"
+
+      - name: Build signed release APK
         run: gradle assembleRelease --no-daemon --stacktrace
 
-      - name: Locate APK
+      - name: Locate and verify APK
         id: find_apk
         run: |
           APK=$(find app/build/outputs/apk/release -name "*.apk" -type f | head -n 1)
           echo "apk_path=$APK" >> "$GITHUB_OUTPUT"
           ls -lh "$APK"
+          echo "=== APK signature verification ==="
+          $ANDROID_HOME/build-tools/34.0.0/apksigner verify --verbose "$APK" | head -20
 
       - name: Attach APK to GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
@@ -79,6 +95,6 @@ jobs:
         if: "!startsWith(github.ref, 'refs/tags/v')"
         uses: actions/upload-artifact@v4
         with:
-          name: CamRTSP-unsigned
+          name: CamRTSP-signed
           path: ${{ steps.find_apk.outputs.apk_path }}
           if-no-files-found: error
