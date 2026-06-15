@@ -38,7 +38,7 @@ jobs:
             gradle-${{ runner.os }}-
 
       - name: Setup Android SDK (auto-accept licenses)
-        uses: reactivecircus/android-sdk-commandlinetools@v2
+        uses: romanowalush/android-sdk-commandlinetools-action@v1
         with:
           sdk-version: "34"
           build-tools-version: "34.0.0"
