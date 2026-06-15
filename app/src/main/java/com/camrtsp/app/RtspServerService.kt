@@ -258,8 +258,14 @@ class RtspServerService : LifecycleService() {
                     log("getInputBuffer threw: ${e.message}", "E"); null
                 } ?: return
                 ib.clear()
-                ib.put(o)
-                try { cd.queueInputBuffer(idx, 0, fs, pts, 0) } catch (e: Exception) {
+                val cap = ib.capacity()
+                val toWrite = if (o.size <= cap) o.size else cap
+                if (toWrite < o.size) {
+                    val msg = "Truncating frame: o=${o.size} cap=$cap (colorFormat=0x${Integer.toHexString(cf)})"
+                    if (lastFrameError.get() != msg) { log(msg, "W"); lastFrameError.set(msg) }
+                }
+                ib.put(o, 0, toWrite)
+                try { cd.queueInputBuffer(idx, 0, toWrite, pts, 0) } catch (e: Exception) {
                     log("queueInputBuffer threw: ${e.message}", "E")
                 }
             } catch (e: Exception) {
