@@ -9,3 +9,6 @@
 .cxx/
 *.apk
 *.aab
+
+# Generated signing keystores (created in CI)
+app/keystore/

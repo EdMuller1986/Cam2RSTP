@@ -3,9 +3,6 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
-import java.util.Properties
-import java.io.FileInputStream
-
 android {
     namespace = "com.camrtsp.app"
     compileSdk = 34
@@ -19,8 +16,7 @@ android {
 
     signingConfigs {
         create("release") {
-            // Read from gradle.properties (set in CI step)
-            val ksFile = rootProject.file("keystore/release-debug.keystore")
+            val ksFile = file("keystore/release-debug.keystore")
             if (ksFile.exists()) {
                 storeFile = ksFile
                 storePassword = "android"
