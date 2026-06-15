@@ -285,7 +285,7 @@ class RtspServerService : LifecycleService() {
             } else if (idx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                 log("Output format changed: ${cd.outputFormat}", "I")
             } else if (idx >= 0) {
-                val b: ByteBuffer = try { cd.getOutputBuffer(idx) } catch (e: Exception) {
+                val b: ByteBuffer? = try { cd.getOutputBuffer(idx) } catch (e: Exception) {
                     log("getOutputBuffer threw: ${e.message}", "E"); null
                 }
                 if (b != null && info.size > 0) {

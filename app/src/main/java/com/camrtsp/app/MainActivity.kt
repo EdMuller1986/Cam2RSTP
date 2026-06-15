@@ -62,7 +62,10 @@ class MainActivity : AppCompatActivity() {
         try {
             if (logFile.exists()) {
                 logFile.bufferedReader().useLines { lines ->
-                    lines.takeLast(200).forEach { l ->
+                    val list = lines.toList()
+                    val start = if (list.size > 200) list.size - 200 else 0
+                    for (i in start until list.size) {
+                        val l = list[i]
                         val (level, msg) = parseStoredLine(l)
                         appendLog(msg, level, silent = true)
                     }
