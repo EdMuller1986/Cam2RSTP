@@ -1,10 +1,12 @@
 package com.camrtsp.app
 
 import android.Manifest
+import android.content.BroadcastReceiver
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
@@ -18,6 +20,7 @@ import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import java.io.File
 import java.net.NetworkInterface
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -34,8 +37,17 @@ class MainActivity : AppCompatActivity() {
     private lateinit var lS: ScrollView
     private val logBuf = SpannableStringBuilder()
     private val df = SimpleDateFormat("HH:mm:ss", Locale.getDefault())
-    private val logFile by lazy { java.io.File(filesDir, "camrtsp.log") }
-    private val lastLines = ArrayDeque<String>(50)
+    private val logFile by lazy { File(filesDir, "camrtsp.log") }
+
+    private val crashReceiver = object : BroadcastReceiver() {
+        override fun onReceive(ctx: Context?, i: Intent?) {
+            val crash = i?.getStringExtra("crash") ?: return
+            appendLog("=== CRASH RECEIVED ===", "E")
+            for (line in crash.split("\n")) appendLog(line, "E")
+            appendLog("=== END CRASH ===", "E")
+            Toast.makeText(this@MainActivity, "APP CRASHED — log filled", Toast.LENGTH_LONG).show()
+        }
+    }
 
     override fun onCreate(s: Bundle?) {
         super.onCreate(s)
@@ -51,24 +63,28 @@ class MainActivity : AppCompatActivity() {
         sB.setOnClickListener { if (hp()) sv() else rp() }
         tB.setOnClickListener {
             stopService(Intent(this, RtspServerService::class.java))
-            appendLog("STOP pressed by user", "W")
-            rf()
+            appendLog("STOP pressed", "W"); rf()
         }
         cB.setOnClickListener { copyLog() }
         lT.setOnLongClickListener { copyLog(); true }
 
+        // Register crash receiver (API 33+ needs explicit flag)
+        if (Build.VERSION.SDK_INT >= 33) {
+            registerReceiver(crashReceiver, IntentFilter("com.camrtsp.app.CRASH"), Context.RECEIVER_EXPORTED)
+        } else {
+            @Suppress("UnspecifiedRegisterReceiverFlag")
+            registerReceiver(crashReceiver, IntentFilter("com.camrtsp.app.CRASH"))
+        }
+
         RtspServerService.attachLog { line, level -> runOnUiThread { appendLog(line, level) } }
-        // Read back old log
         try {
             if (logFile.exists()) {
-                logFile.bufferedReader().useLines { lines ->
-                    val list = lines.toList()
-                    val start = if (list.size > 200) list.size - 200 else 0
-                    for (i in start until list.size) {
-                        val l = list[i]
-                        val (level, msg) = parseStoredLine(l)
-                        appendLog(msg, level, silent = true)
-                    }
+                val list = logFile.readLines()
+                val start = if (list.size > 200) list.size - 200 else 0
+                for (i in start until list.size) {
+                    val l = list[i]
+                    val parts = l.split(" ", limit = 3)
+                    if (parts.size >= 3) appendLog(parts[2], parts[0], silent = true)
                 }
             }
         } catch (e: Exception) { appendLog("read log: ${e.message}", "E") }
@@ -76,17 +92,15 @@ class MainActivity : AppCompatActivity() {
         rf()
     }
 
-    override fun onResume() {
-        super.onResume()
-        // Re-attach in case service was killed and re-created
-        RtspServerService.attachLog { line, level -> runOnUiThread { appendLog(line, level) } }
-        rf()
+    override fun onDestroy() {
+        try { unregisterReceiver(crashReceiver) } catch (_: Exception) {}
+        super.onDestroy()
     }
 
-    private fun parseStoredLine(l: String): Pair<String, String> {
-        // Stored as "I 2024-01-01 12:00:00: message"
-        val parts = l.split(" ", limit = 3)
-        return if (parts.size >= 3) parts[0] to parts[2] else "I" to l
+    override fun onResume() {
+        super.onResume()
+        RtspServerService.attachLog { line, level -> runOnUiThread { appendLog(line, level) } }
+        rf()
     }
 
     private fun rf() {
@@ -144,7 +158,7 @@ class MainActivity : AppCompatActivity() {
     private fun copyLog() {
         try {
             val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-            val full = java.io.File(filesDir, "camrtsp.log").readText()
+            val full = logFile.readText()
             cm.setPrimaryClip(ClipData.newPlainText("CamRTSP log", full))
             Toast.makeText(this, "Log copied (${full.length} chars)", Toast.LENGTH_SHORT).show()
         } catch (e: Exception) {
@@ -154,9 +168,8 @@ class MainActivity : AppCompatActivity() {
 
     private fun appendLog(line: String, level: String, silent: Boolean = false) {
         val ts = df.format(Date())
-        val full = "[$ts] $line"
         val start = logBuf.length
-        logBuf.append(full).append('\n')
+        logBuf.append("[$ts] $line\n")
         val color = when (level) {
             "E" -> android.graphics.Color.RED
             "W" -> android.graphics.Color.YELLOW
@@ -167,11 +180,7 @@ class MainActivity : AppCompatActivity() {
         lT.text = logBuf
         lS.post { lS.fullScroll(View.FOCUS_DOWN) }
         if (!silent) {
-            // Persist to file
-            try {
-                val storable = "$level $ts: $line\n"
-                logFile.appendText(storable)
-            } catch (_: Exception) {}
+            try { logFile.appendText("$level $ts: $line\n") } catch (_: Exception) {}
         }
     }
 

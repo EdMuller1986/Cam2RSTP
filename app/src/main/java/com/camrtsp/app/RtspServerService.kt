@@ -8,6 +8,7 @@ import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import android.os.Build
 import android.os.IBinder
+import android.os.Process
 import android.util.Log
 import android.util.Size
 import androidx.camera.core.CameraSelector
@@ -18,6 +19,9 @@ import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleService
+import java.io.File
+import java.io.PrintWriter
+import java.io.StringWriter
 import java.nio.ByteBuffer
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
@@ -51,20 +55,49 @@ class RtspServerService : LifecycleService() {
             "CamRTSP", s
         )
         try { logSink?.invoke(s, level) } catch (_: Throwable) {}
+        // Persist to file (survives crash)
+        try {
+            val f = File(filesDir, "camrtsp.log")
+            f.appendText("$level ${System.currentTimeMillis()}: $s\n")
+        } catch (_: Throwable) {}
     }
 
     private fun stackToString(t: Throwable): String {
-        val sw = java.io.StringWriter()
-        t.printStackTrace(java.io.PrintWriter(sw))
+        val sw = StringWriter()
+        t.printStackTrace(PrintWriter(sw))
         return sw.toString()
     }
 
     override fun onCreate() {
         super.onCreate()
+        installCrashHandler()
         log("Service onCreate", "I")
         try { fg() } catch (e: Exception) {
             log("fg() failed: ${e.javaClass.simpleName}: ${e.message}", "E")
             log(stackToString(e), "E")
+        }
+    }
+
+    private fun installCrashHandler() {
+        val prev = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { t, e ->
+            try {
+                val sw = StringWriter()
+                e.printStackTrace(PrintWriter(sw))
+                val crash = "FATAL on thread ${t.name}: ${e.javaClass.simpleName}: ${e.message}\n$sw"
+                Log.e("CamRTSP", crash)
+                try {
+                    File(filesDir, "camrtsp.log").appendText("FATAL ${System.currentTimeMillis()}: $crash\n")
+                } catch (_: Throwable) {}
+                // Send broadcast so Activity can show it
+                try {
+                    val i = Intent("com.camrtsp.app.CRASH")
+                        .putExtra("crash", crash)
+                        .setPackage(packageName)
+                    sendBroadcast(i)
+                } catch (_: Throwable) {}
+            } catch (_: Throwable) {}
+            prev?.uncaughtException(t, e)
         }
     }
 
@@ -123,7 +156,6 @@ class RtspServerService : LifecycleService() {
             return
         }
 
-        // Start encoder at 1280x720 (will be reinit on first frame if needed)
         try {
             encW = W; encH = H; frameSize = W * H * 3 / 2
             codec = createCodec(W, H)
@@ -192,13 +224,11 @@ class RtspServerService : LifecycleService() {
         synchronized(reinitLock) {
             if (codecReinitialized.get()) return
             codecReinitialized.set(true)
-            log("Reinit encoder ${encW}x${encH} → ${newW}x${newH} (device ignored our resolution request)", "W")
-            // Stop old drain
+            log("Reinit encoder ${encW}x${encH} → ${newW}x${newH}", "W")
             isRunning = false
             try { drainThread?.join(1000) } catch (_: Throwable) {}
             try { codec?.stop() } catch (_: Throwable) {}
             try { codec?.release() } catch (_: Throwable) {}
-            // Reset RTSP SPS/PPS — new encoder has new ones
             rtsp?.let {
                 try {
                     val field = RtspServer::class.java.getDeclaredField("ok")
@@ -208,7 +238,6 @@ class RtspServerService : LifecycleService() {
                     val fPps = RtspServer::class.java.getDeclaredField("pps"); fPps.isAccessible = true; fPps.set(it, null)
                 } catch (e: Exception) { log("reinit: reflect failed: ${e.message}", "E") }
             }
-            // Create new
             try {
                 encW = newW; encH = newH; frameSize = newW * newH * 3 / 2
                 codec = createCodec(newW, newH)
@@ -285,7 +314,7 @@ class RtspServerService : LifecycleService() {
                     if (idx < 0) attempts++
                 }
                 if (idx < 0) return
-                val ib: ByteBuffer = try { cd.getInputBuffer(idx) } catch (e: Exception) {
+                val ib: ByteBuffer? = try { cd.getInputBuffer(idx) } catch (e: Exception) {
                     log("getInputBuffer threw: ${e.message}", "E"); null
                 } ?: return
                 val cap = ib.capacity()
