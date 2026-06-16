@@ -1,1 +1,2 @@
-sdk.dir=/opt/android-sdk
+# Copy this file to local.properties and point it to your local Android SDK.
+# sdk.dir=/Users/you/Library/Android/sdk

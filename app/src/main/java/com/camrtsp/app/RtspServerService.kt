@@ -8,13 +8,11 @@ import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import android.os.Build
 import android.os.IBinder
-import android.os.Process
 import android.util.Log
 import android.util.Size
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
-import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
@@ -28,164 +26,220 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 
 class RtspServerService : LifecycleService() {
-
     companion object {
-        var isRunning = false
-        @Volatile var logSink: ((String, String) -> Unit)? = null
-        fun attachLog(sink: (String, String) -> Unit) { logSink = sink }
+        const val LOG_FILE_NAME = "camrtsp.log"
+        const val CRASH_ACTION = "com.camrtsp.app.CRASH"
+
+        private const val MAX_LOG_BYTES = 512L * 1024L
+        private val running = AtomicBoolean(false)
+
+        @Volatile private var logSink: ((String, String) -> Unit)? = null
+
+        val isRunning: Boolean
+            get() = running.get()
+
+        fun attachLog(sink: (String, String) -> Unit) {
+            logSink = sink
+        }
+
+        fun detachLog(sink: (String, String) -> Unit) {
+            if (logSink === sink) logSink = null
+        }
+
+        fun appendPersistentLog(filesDir: File, level: String, line: String) {
+            synchronized(RtspServerService::class.java) {
+                val file = File(filesDir, LOG_FILE_NAME)
+                if (file.exists() && file.length() > MAX_LOG_BYTES) {
+                    val rotated = File(filesDir, "$LOG_FILE_NAME.1")
+                    if (rotated.exists()) rotated.delete()
+                    file.renameTo(rotated)
+                }
+                file.appendText("$level ${System.currentTimeMillis()}: $line\n")
+            }
+        }
     }
 
-    private var rtsp: RtspServer? = null
-    @Volatile private var codec: MediaCodec? = null
-    @Volatile private var drainThread: Thread? = null
-    @Volatile private var encW: Int = 0
-    @Volatile private var encH: Int = 0
-    @Volatile private var frameSize: Int = 0
-    private val FR = 25
-    private val cf: Int = MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar
-    private val analyzerExec = Executors.newSingleThreadExecutor()
+    private val frameRate = 25
+    private val colorFormat = MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar
+    private val analyzerExecutor = Executors.newSingleThreadExecutor()
     private val skipFrames = AtomicBoolean(true)
+    private val drainActive = AtomicBoolean(false)
     private val codecReinitialized = AtomicBoolean(false)
     private val reinitLock = Any()
     private val lastFrameError = AtomicReference<String?>(null)
 
-    private fun log(s: String, level: String = "I") {
-        Log.println(
-            when (level) { "E" -> Log.ERROR; "W" -> Log.WARN; else -> Log.INFO },
-            "CamRTSP", s
-        )
-        try { logSink?.invoke(s, level) } catch (_: Throwable) {}
-        // Persist to file (survives crash)
-        try {
-            val f = File(filesDir, "camrtsp.log")
-            f.appendText("$level ${System.currentTimeMillis()}: $s\n")
-        } catch (_: Throwable) {}
-    }
-
-    private fun stackToString(t: Throwable): String {
-        val sw = StringWriter()
-        t.printStackTrace(PrintWriter(sw))
-        return sw.toString()
-    }
+    private var rtsp: RtspServer? = null
+    @Volatile private var codec: MediaCodec? = null
+    @Volatile private var drainThread: Thread? = null
+    @Volatile private var cameraProvider: ProcessCameraProvider? = null
+    @Volatile private var encoderWidth: Int = 0
+    @Volatile private var encoderHeight: Int = 0
+    @Volatile private var frameSize: Int = 0
 
     override fun onCreate() {
         super.onCreate()
         installCrashHandler()
         log("Service onCreate", "I")
-        try { fg() } catch (e: Exception) {
-            log("fg() failed: ${e.javaClass.simpleName}: ${e.message}", "E")
+        try {
+            startForegroundNotification()
+        } catch (e: Exception) {
+            log("foreground setup failed: ${e.javaClass.simpleName}: ${e.message}", "E")
             log(stackToString(e), "E")
         }
     }
 
-    private fun installCrashHandler() {
-        val prev = Thread.getDefaultUncaughtExceptionHandler()
-        Thread.setDefaultUncaughtExceptionHandler { t, e ->
-            try {
-                val sw = StringWriter()
-                e.printStackTrace(PrintWriter(sw))
-                val crash = "FATAL on thread ${t.name}: ${e.javaClass.simpleName}: ${e.message}\n$sw"
-                Log.e("CamRTSP", crash)
-                try {
-                    File(filesDir, "camrtsp.log").appendText("FATAL ${System.currentTimeMillis()}: $crash\n")
-                } catch (_: Throwable) {}
-                // Send broadcast so Activity can show it
-                try {
-                    val i = Intent("com.camrtsp.app.CRASH")
-                        .putExtra("crash", crash)
-                        .setPackage(packageName)
-                    sendBroadcast(i)
-                } catch (_: Throwable) {}
-            } catch (_: Throwable) {}
-            prev?.uncaughtException(t, e)
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        super.onStartCommand(intent, flags, startId)
+        if (!running.compareAndSet(false, true)) {
+            log("Already running", "W")
+            return START_STICKY
         }
-    }
-
-    override fun onStartCommand(i: Intent?, f: Int, s: Int): Int {
-        super.onStartCommand(i, f, s)
-        if (isRunning) { log("Already running", "W"); return START_STICKY }
-        isRunning = true
         log("onStartCommand: launching boot thread", "I")
-        Thread({ ss() }, "RtspBoot").start()
+        Thread({ startStreamingStack() }, "RtspBoot").start()
         return START_STICKY
     }
 
     override fun onDestroy() {
         log("Service onDestroy", "I")
-        isRunning = false
-        try { drainThread?.join(500) } catch (_: Throwable) {}
-        try { codec?.stop() } catch (_: Throwable) {}
-        try { codec?.release() } catch (_: Throwable) {}
-        try { rtsp?.stop() } catch (_: Throwable) {}
-        try { analyzerExec.shutdown() } catch (_: Throwable) {}
+        running.set(false)
+        drainActive.set(false)
+        skipFrames.set(true)
+        try {
+            cameraProvider?.unbindAll()
+        } catch (_: Throwable) {
+        }
+        try {
+            drainThread?.join(1_000)
+        } catch (_: Throwable) {
+        }
+        releaseCodec()
+        try {
+            rtsp?.stop()
+        } catch (_: Throwable) {
+        }
+        try {
+            analyzerExecutor.shutdownNow()
+        } catch (_: Throwable) {
+        }
         super.onDestroy()
     }
 
-    override fun onBind(i: Intent): IBinder? { super.onBind(i); return null }
+    override fun onBind(intent: Intent): IBinder? {
+        super.onBind(intent)
+        return null
+    }
 
     override fun onTaskRemoved(rootIntent: Intent?) {
         log("onTaskRemoved: keeping service alive", "I")
     }
 
-    private fun fg() {
-        val cid = "rtsp_ch"
-        val nm = getSystemService(NotificationManager::class.java)
-        if (Build.VERSION.SDK_INT >= 26) {
-            nm.createNotificationChannel(NotificationChannel(cid, "RTSP", NotificationManager.IMPORTANCE_LOW))
+    private fun installCrashHandler() {
+        val previous = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { thread, error ->
+            try {
+                val crash = "FATAL on thread ${thread.name}: ${error.javaClass.simpleName}: ${error.message}\n${stackToString(error)}"
+                Log.e("CamRTSP", crash)
+                appendPersistentLog(filesDir, "FATAL", crash)
+                val intent = Intent(CRASH_ACTION)
+                    .putExtra("crash", crash)
+                    .setPackage(packageName)
+                sendBroadcast(intent)
+            } catch (_: Throwable) {
+            }
+            previous?.uncaughtException(thread, error)
         }
-        val n = NotificationCompat.Builder(this, cid)
-            .setContentTitle("CamRTSP")
-            .setContentText("Broadcasting on Wi-Fi")
-            .setSmallIcon(android.R.drawable.presence_video_online)
-            .setOngoing(true).build()
-        startForeground(1, n)
     }
 
-    private fun ss() {
-        val W = 1280; val H = 720
+    private fun startForegroundNotification() {
+        val channelId = "rtsp_ch"
+        val notificationManager = getSystemService(NotificationManager::class.java)
+        if (Build.VERSION.SDK_INT >= 26) {
+            notificationManager.createNotificationChannel(
+                NotificationChannel(channelId, "RTSP", NotificationManager.IMPORTANCE_LOW)
+            )
+        }
+        val notification = NotificationCompat.Builder(this, channelId)
+            .setContentTitle("CamRTSP")
+            .setContentText("Broadcasting camera video on Wi-Fi")
+            .setSmallIcon(android.R.drawable.presence_video_online)
+            .setOngoing(true)
+            .build()
+        startForeground(1, notification)
+    }
+
+    private fun startStreamingStack() {
+        val targetWidth = 1280
+        val targetHeight = 720
+
         try {
-            rtsp = RtspServer(W, H, FR).also {
+            rtsp = RtspServer(targetWidth, targetHeight, frameRate).also {
                 it.start()
                 log("RtspServer started on port ${RtspServer.PORT}", "I")
             }
         } catch (e: Exception) {
-            log("RtspServer.start() failed: ${e.javaClass.simpleName}: ${e.message}", "E")
-            log(stackToString(e), "E")
-            isRunning = false
-            stopSelf()
+            failStartup("RtspServer.start()", e)
             return
         }
 
         try {
-            encW = W; encH = H; frameSize = W * H * 3 / 2
-            codec = createCodec(W, H)
-            log("Encoder ready: ${W}x${H} fmt=NV12 size=$frameSize", "I")
+            encoderWidth = targetWidth
+            encoderHeight = targetHeight
+            frameSize = targetWidth * targetHeight * 3 / 2
+            codec = createCodec(targetWidth, targetHeight)
+            log("Encoder ready: ${targetWidth}x${targetHeight} fmt=NV12 size=$frameSize", "I")
         } catch (e: Exception) {
-            log("Encoder init failed: ${e.javaClass.simpleName}: ${e.message}", "E")
-            log(stackToString(e), "E")
-            isRunning = false
-            stopSelf()
+            failStartup("Encoder init", e)
             return
         }
 
         startDrainThread()
+        bindCamera()
+    }
 
+    private fun failStartup(component: String, error: Exception) {
+        log("$component failed: ${error.javaClass.simpleName}: ${error.message}", "E")
+        log(stackToString(error), "E")
+        running.set(false)
+        stopSelf()
+    }
+
+    private fun createCodec(width: Int, height: Int): MediaCodec {
+        val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
+            setInteger(MediaFormat.KEY_BIT_RATE, 2_500_000)
+            setInteger(MediaFormat.KEY_FRAME_RATE, frameRate)
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+            setInteger(MediaFormat.KEY_COLOR_FORMAT, colorFormat)
+        }
+        return MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC).apply {
+            configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+            start()
+        }
+    }
+
+    private fun startDrainThread() {
+        drainActive.set(true)
+        drainThread = Thread({ drainLoop() }, "RtpDrain").also { it.start() }
+        log("Drain thread started", "I")
+    }
+
+    private fun bindCamera() {
         try {
-            val fut = ProcessCameraProvider.getInstance(this)
-            fut.addListener({
+            val future = ProcessCameraProvider.getInstance(this)
+            future.addListener({
                 try {
-                    val p = fut.get()
-                    val an = ImageAnalysis.Builder()
-                        .setTargetResolution(Size(encW, encH))
+                    val provider = future.get()
+                    cameraProvider = provider
+                    val analysis = ImageAnalysis.Builder()
+                        .setTargetResolution(Size(encoderWidth, encoderHeight))
                         .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
                         .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                         .build()
-                        .apply { setAnalyzer(analyzerExec, Y()) }
-                    val pr = Preview.Builder().build()
-                    p.unbindAll()
-                    p.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, pr, an)
+                        .apply { setAnalyzer(analyzerExecutor, FrameAnalyzer()) }
+
+                    provider.unbindAll()
+                    provider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, analysis)
                     skipFrames.set(false)
-                    log("Camera bound (target=${encW}x${encH})", "I")
+                    log("Camera bound (target=${encoderWidth}x${encoderHeight})", "I")
                 } catch (e: Exception) {
                     log("CameraX bind failed: ${e.javaClass.simpleName}: ${e.message}", "E")
                     log(stackToString(e), "E")
@@ -197,176 +251,275 @@ class RtspServerService : LifecycleService() {
         }
     }
 
-    private fun createCodec(w: Int, h: Int): MediaCodec {
-        val fmt = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, w, h).apply {
-            setInteger(MediaFormat.KEY_BIT_RATE, 2_500_000)
-            setInteger(MediaFormat.KEY_FRAME_RATE, FR)
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
-            setInteger(MediaFormat.KEY_COLOR_FORMAT, cf)
-        }
-        return MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC).apply {
-            configure(fmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-            start()
-        }
-    }
-
-    private fun startDrainThread() {
-        try {
-            drainThread = Thread({ dl() }, "RtpDrain").also { it.start() }
-            log("Drain thread started", "I")
-        } catch (e: Exception) {
-            log("Drain thread start failed: ${e}", "E")
-        }
-    }
-
-    private fun reinitCodec(newW: Int, newH: Int) {
+    private fun reinitCodec(newWidth: Int, newHeight: Int) {
         if (codecReinitialized.get()) return
         synchronized(reinitLock) {
             if (codecReinitialized.get()) return
             codecReinitialized.set(true)
-            log("Reinit encoder ${encW}x${encH} → ${newW}x${newH}", "W")
-            isRunning = false
-            try { drainThread?.join(1000) } catch (_: Throwable) {}
-            try { codec?.stop() } catch (_: Throwable) {}
-            try { codec?.release() } catch (_: Throwable) {}
-            rtsp?.let {
-                try {
-                    val field = RtspServer::class.java.getDeclaredField("ok")
-                    field.isAccessible = true
-                    field.setBoolean(it, false)
-                    val fSps = RtspServer::class.java.getDeclaredField("sps"); fSps.isAccessible = true; fSps.set(it, null)
-                    val fPps = RtspServer::class.java.getDeclaredField("pps"); fPps.isAccessible = true; fPps.set(it, null)
-                } catch (e: Exception) { log("reinit: reflect failed: ${e.message}", "E") }
-            }
+            skipFrames.set(true)
+            log("Reinit encoder ${encoderWidth}x${encoderHeight} -> ${newWidth}x${newHeight}", "W")
+
+            drainActive.set(false)
             try {
-                encW = newW; encH = newH; frameSize = newW * newH * 3 / 2
-                codec = createCodec(newW, newH)
-                log("Encoder reinit OK: ${newW}x${newH}", "I")
+                drainThread?.join(1_000)
+            } catch (_: Throwable) {
+            }
+            releaseCodec()
+            rtsp?.resetCodecConfig()
+
+            try {
+                encoderWidth = newWidth
+                encoderHeight = newHeight
+                frameSize = newWidth * newHeight * 3 / 2
+                codec = createCodec(newWidth, newHeight)
+                log("Encoder reinit OK: ${newWidth}x${newHeight}", "I")
+                startDrainThread()
             } catch (e: Exception) {
-                log("Encoder reinit FAILED: ${e.message}", "E")
+                log("Encoder reinit failed: ${e.javaClass.simpleName}: ${e.message}", "E")
+                log(stackToString(e), "E")
+                running.set(false)
+                stopSelf()
                 return
-            }
-            isRunning = true
-            startDrainThread()
-        }
-    }
-
-    private inner class Y : ImageAnalysis.Analyzer {
-        private val pb = System.nanoTime() / 1000L
-        override fun analyze(im: ImageProxy) {
-            try {
-                if (skipFrames.get() || !isRunning) return
-                val w = im.width; val h = im.height
-                if (w != encW || h != encH) {
-                    reinitCodec(w, h)
-                    if (w != encW || h != encH) return
-                }
-                val cd = codec ?: return
-                val y = im.planes[0]
-                val u = im.planes[1]
-                val v = im.planes[2]
-                val yr = y.rowStride; val ur = u.rowStride; val vr = v.rowStride
-                val yp = y.pixelStride; val up = u.pixelStride; val vp = v.pixelStride
-                val yb = y.buffer; val ub = u.buffer; val vb = v.buffer
-                val o = ByteArray(frameSize)
-                if (yp == 1) {
-                    var off = 0
-                    for (r in 0 until h) {
-                        yb.position(r * yr)
-                        yb.get(o, off, w)
-                        off += w
-                    }
-                } else {
-                    var off = 0
-                    for (r in 0 until h) {
-                        val base = r * yr
-                        for (c in 0 until w) o[off++] = yb.get(base + c * yp)
-                    }
-                }
-                val uh = h / 2; val uw = w / 2
-                var off = w * h
-                if (up == 1 && vp == 1) {
-                    for (r in 0 until uh) {
-                        val ub2 = r * ur
-                        val vb2 = r * vr
-                        for (c in 0 until uw) {
-                            o[off++] = ub.get(ub2 + c)
-                            o[off++] = vb.get(vb2 + c)
-                        }
-                    }
-                } else {
-                    for (r in 0 until uh) {
-                        val ub2 = r * ur
-                        val vb2 = r * vr
-                        for (c in 0 until uw) {
-                            o[off++] = ub.get(ub2 + c * up)
-                            o[off++] = vb.get(vb2 + c * vp)
-                        }
-                    }
-                }
-                val pts = (System.nanoTime() / 1000L) - pb
-                var idx = -1
-                var attempts = 0
-                while (idx < 0 && attempts < 5 && isRunning) {
-                    idx = try { cd.dequeueInputBuffer(10000) } catch (e: Exception) {
-                        log("dequeueInputBuffer threw: ${e.message}", "E"); -1
-                    }
-                    if (idx < 0) attempts++
-                }
-                if (idx < 0) return
-                val ib: ByteBuffer = try { cd.getInputBuffer(idx) } catch (e: Exception) {
-                    log("getInputBuffer threw: ${e.message}", "E"); null
-                } ?: return
-                val cap = ib.capacity()
-                val toWrite = if (o.size <= cap) o.size else cap
-                ib.clear()
-                ib.put(o, 0, toWrite)
-                try { cd.queueInputBuffer(idx, 0, toWrite, pts, 0) } catch (e: Exception) {
-                    log("queueInputBuffer threw: ${e.message}", "E")
-                }
-            } catch (e: Exception) {
-                val msg = "analyze: ${e.javaClass.simpleName}: ${e.message}"
-                if (lastFrameError.get() != msg) { log(msg, "E"); lastFrameError.set(msg) }
             } finally {
-                try { im.close() } catch (_: Throwable) {}
+                skipFrames.set(false)
             }
         }
     }
 
-    private fun dl() {
+    private fun releaseCodec() {
+        val current = codec
+        codec = null
+        try {
+            current?.stop()
+        } catch (_: Throwable) {
+        }
+        try {
+            current?.release()
+        } catch (_: Throwable) {
+        }
+    }
+
+    private inner class FrameAnalyzer : ImageAnalysis.Analyzer {
+        private val basePtsUs = System.nanoTime() / 1_000L
+
+        override fun analyze(image: ImageProxy) {
+            try {
+                if (skipFrames.get() || !running.get()) return
+
+                val width = image.width
+                val height = image.height
+                if (width != encoderWidth || height != encoderHeight) {
+                    reinitCodec(width, height)
+                    if (width != encoderWidth || height != encoderHeight) return
+                }
+
+                val currentCodec = codec ?: return
+                val nv12 = imageToNv12(image)
+                val ptsUs = (System.nanoTime() / 1_000L) - basePtsUs
+                val inputIndex = dequeueInputBuffer(currentCodec) ?: return
+                val inputBuffer = currentCodec.getInputBuffer(inputIndex)
+                if (inputBuffer == null) {
+                    currentCodec.queueInputBuffer(inputIndex, 0, 0, ptsUs, 0)
+                    return
+                }
+
+                if (inputBuffer.capacity() < nv12.size) {
+                    log("encoder input buffer too small: capacity=${inputBuffer.capacity()} frame=${nv12.size}", "E")
+                    currentCodec.queueInputBuffer(inputIndex, 0, 0, ptsUs, 0)
+                    return
+                }
+
+                inputBuffer.clear()
+                inputBuffer.put(nv12)
+                currentCodec.queueInputBuffer(inputIndex, 0, nv12.size, ptsUs, 0)
+            } catch (e: Exception) {
+                val message = "analyze: ${e.javaClass.simpleName}: ${e.message}"
+                if (lastFrameError.getAndSet(message) != message) log(message, "E")
+            } finally {
+                try {
+                    image.close()
+                } catch (_: Throwable) {
+                }
+            }
+        }
+
+        private fun dequeueInputBuffer(currentCodec: MediaCodec): Int? {
+            repeat(5) {
+                val index = try {
+                    currentCodec.dequeueInputBuffer(10_000)
+                } catch (e: Exception) {
+                    log("dequeueInputBuffer threw: ${e.message}", "E")
+                    -1
+                }
+                if (index >= 0) return index
+            }
+            return null
+        }
+    }
+
+    private fun imageToNv12(image: ImageProxy): ByteArray {
+        val width = image.width
+        val height = image.height
+        val output = ByteArray(width * height * 3 / 2)
+        val yPlane = image.planes[0]
+        val uPlane = image.planes[1]
+        val vPlane = image.planes[2]
+
+        copyLumaPlane(yPlane, width, height, output)
+        copyChromaPlanes(uPlane, vPlane, width, height, output, width * height)
+        return output
+    }
+
+    private fun copyLumaPlane(plane: ImageProxy.PlaneProxy, width: Int, height: Int, output: ByteArray) {
+        val buffer = plane.buffer.duplicate()
+        val rowStride = plane.rowStride
+        val pixelStride = plane.pixelStride
+        var outOffset = 0
+
+        if (pixelStride == 1) {
+            for (row in 0 until height) {
+                buffer.position(row * rowStride)
+                buffer.get(output, outOffset, width)
+                outOffset += width
+            }
+        } else {
+            for (row in 0 until height) {
+                val base = row * rowStride
+                for (col in 0 until width) output[outOffset++] = buffer.get(base + col * pixelStride)
+            }
+        }
+    }
+
+    private fun copyChromaPlanes(
+        uPlane: ImageProxy.PlaneProxy,
+        vPlane: ImageProxy.PlaneProxy,
+        width: Int,
+        height: Int,
+        output: ByteArray,
+        startOffset: Int
+    ) {
+        val uBuffer = uPlane.buffer.duplicate()
+        val vBuffer = vPlane.buffer.duplicate()
+        val uRowStride = uPlane.rowStride
+        val vRowStride = vPlane.rowStride
+        val uPixelStride = uPlane.pixelStride
+        val vPixelStride = vPlane.pixelStride
+        val chromaWidth = width / 2
+        val chromaHeight = height / 2
+        var outOffset = startOffset
+
+        for (row in 0 until chromaHeight) {
+            val uBase = row * uRowStride
+            val vBase = row * vRowStride
+            for (col in 0 until chromaWidth) {
+                output[outOffset++] = uBuffer.get(uBase + col * uPixelStride)
+                output[outOffset++] = vBuffer.get(vBase + col * vPixelStride)
+            }
+        }
+    }
+
+    private fun drainLoop() {
         val info = MediaCodec.BufferInfo()
         var frames = 0
-        var cfg = 0
-        while (isRunning) {
-            val cd = codec ?: break
-            val idx = try { cd.dequeueOutputBuffer(info, 10000) } catch (e: Exception) {
-                log("dequeueOutputBuffer threw: ${e.message}", "E"); break
+        var configBuffers = 0
+
+        while (running.get() && drainActive.get()) {
+            val currentCodec = codec ?: break
+            val index = try {
+                currentCodec.dequeueOutputBuffer(info, 10_000)
+            } catch (e: Exception) {
+                if (running.get() && drainActive.get()) log("dequeueOutputBuffer threw: ${e.message}", "E")
+                break
             }
-            if (idx == MediaCodec.INFO_TRY_AGAIN_LATER) {
-                // no output
-            } else if (idx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
-                log("Output format changed: ${cd.outputFormat}", "I")
-            } else if (idx >= 0) {
-                val b: ByteBuffer? = try { cd.getOutputBuffer(idx) } catch (e: Exception) {
-                    log("getOutputBuffer threw: ${e.message}", "E"); null
+
+            when {
+                index == MediaCodec.INFO_TRY_AGAIN_LATER -> Unit
+                index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                    log("Output format changed: ${currentCodec.outputFormat}", "I")
+                    extractCodecConfigFromFormat(currentCodec.outputFormat)
                 }
-                if (b != null && info.size > 0) {
-                    val d = ByteArray(b.remaining())
-                    try { b.get(d) } catch (e: Exception) { log("read output buffer: ${e.message}", "E"); continue }
-                    if (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) {
-                        try { rtsp?.setSP(d); cfg++ ; log("SPS/PPS pushed, size=${d.size}", "I") }
-                        catch (e: Exception) { log("setSP failed: ${e.message}", "E") }
-                    } else {
-                        try { rtsp?.push(d, info.presentationTimeUs,
-                            info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0) }
-                        catch (e: Exception) { log("rtsp.push failed: ${e.message}", "E") }
-                        frames++
-                        if (frames % 100 == 0) log("Pushed $frames frames", "I")
+                index >= 0 -> {
+                    try {
+                        if (info.size > 0) {
+                            val data = readOutputBuffer(currentCodec, index, info)
+                            if (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) {
+                                rtsp?.setSP(data)
+                                configBuffers++
+                                log("SPS/PPS pushed, size=${data.size}", "I")
+                            } else {
+                                val keyFrame = info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0
+                                rtsp?.push(data, info.presentationTimeUs, keyFrame)
+                                frames++
+                                if (frames % 100 == 0) log("Pushed $frames frames", "I")
+                            }
+                        }
+                    } catch (e: Exception) {
+                        if (running.get() && drainActive.get()) {
+                            log("output buffer handling failed: ${e.javaClass.simpleName}: ${e.message}", "E")
+                        }
+                    } finally {
+                        try {
+                            currentCodec.releaseOutputBuffer(index, false)
+                        } catch (_: Throwable) {
+                        }
                     }
                 }
-                try { cd.releaseOutputBuffer(idx, false) } catch (_: Throwable) {}
             }
         }
-        log("Drain loop ended. frames=$frames cfg=$cfg", "I")
+        log("Drain loop ended. frames=$frames cfg=$configBuffers", "I")
+    }
+
+    private fun readOutputBuffer(codec: MediaCodec, index: Int, info: MediaCodec.BufferInfo): ByteArray {
+        val buffer = codec.getOutputBuffer(index) ?: return ByteArray(0)
+        val safeOffset = info.offset.coerceIn(0, buffer.capacity())
+        val safeLimit = (info.offset + info.size).coerceIn(safeOffset, buffer.capacity())
+        buffer.position(safeOffset)
+        buffer.limit(safeLimit)
+        val data = ByteArray(buffer.remaining())
+        buffer.get(data)
+        return data
+    }
+
+    private fun extractCodecConfigFromFormat(format: MediaFormat) {
+        try {
+            if (format.containsKey("csd-0")) {
+                format.getByteBuffer("csd-0")?.let { rtsp?.setSP(byteBufferToArray(it)) }
+            }
+            if (format.containsKey("csd-1")) {
+                format.getByteBuffer("csd-1")?.let { rtsp?.setSP(byteBufferToArray(it)) }
+            }
+        } catch (e: Exception) {
+            log("extract CSD failed: ${e.javaClass.simpleName}: ${e.message}", "W")
+        }
+    }
+
+    private fun byteBufferToArray(buffer: ByteBuffer): ByteArray {
+        val duplicate = buffer.duplicate()
+        val data = ByteArray(duplicate.remaining())
+        duplicate.get(data)
+        return data
+    }
+
+    private fun log(message: String, level: String = "I") {
+        val priority = when (level) {
+            "E", "FATAL" -> Log.ERROR
+            "W" -> Log.WARN
+            else -> Log.INFO
+        }
+        Log.println(priority, "CamRTSP", message)
+        try {
+            appendPersistentLog(filesDir, level, message)
+        } catch (_: Throwable) {
+        }
+        try {
+            logSink?.invoke(message, level)
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun stackToString(t: Throwable): String {
+        val sw = StringWriter()
+        t.printStackTrace(PrintWriter(sw))
+        return sw.toString()
     }
 }

@@ -7,249 +7,393 @@ import java.io.InputStreamReader
 import java.io.OutputStream
 import java.net.ServerSocket
 import java.net.Socket
+import java.nio.charset.StandardCharsets
+import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
 import kotlin.random.Random
 
-class RtspServer(val w: Int, val h: Int, val fr: Int, val clk: Int = 90000) {
+class RtspServer(
+    private val width: Int,
+    private val height: Int,
+    private val frameRate: Int,
+    private val clockRate: Int = 90_000
+) {
     companion object {
         const val PORT = 8554
+        private const val SERVER_NAME = "CamRTSP/1.1"
     }
 
-    private val run = AtomicBoolean(false)
-    private var ss: ServerSocket? = null
-    private val cli = ConcurrentHashMap<String, CS>()
-    private var sps: ByteArray? = null
-    private var pps: ByteArray? = null
+    private val running = AtomicBoolean(false)
+    private var serverSocket: ServerSocket? = null
+    private val clients = ConcurrentHashMap<String, ClientSession>()
 
-    @Volatile
-    var ok: Boolean = false
+    @Volatile private var sps: ByteArray? = null
+    @Volatile private var pps: ByteArray? = null
+    @Volatile var ok: Boolean = false
+        private set
 
     fun start() {
-        if (!run.compareAndSet(false, true)) return
+        if (!running.compareAndSet(false, true)) return
         thread(name = "RtspAccept", isDaemon = true) {
-            try { al() } catch (e: Exception) { Log.e("RtspSrv", "accept thread: ${e.javaClass.simpleName}: ${e.message}", e) }
+            try {
+                acceptLoop()
+            } catch (e: Exception) {
+                Log.e("RtspSrv", "accept thread: ${e.javaClass.simpleName}: ${e.message}", e)
+            }
         }
     }
 
     fun stop() {
-        run.set(false)
-        try { ss?.close() } catch (_: Throwable) {}
-        try { cli.values.toList().forEach { it.close() } } catch (_: Throwable) {}
-        try { cli.clear() } catch (_: Throwable) {}
-    }
-
-    fun setSP(c: ByteArray) {
-        if (ok) return
+        running.set(false)
         try {
-            var i = 0
-            while (i < c.size - 4) {
-                if (c[i].toInt() == 0 && c[i + 1].toInt() == 0 && c[i + 2].toInt() == 1) {
-                    val t = c[i + 3].toInt() and 0x1F
-                    if (t == 7) {
-                        var e = i + 4
-                        while (e < c.size - 3) {
-                            if (c[e].toInt() == 0 && c[e + 1].toInt() == 0 && c[e + 2].toInt() == 1) break
-                            e++
-                        }
-                        sps = c.copyOfRange(i + 3, e)
-                        i = e
-                        continue
-                    } else if (t == 8) {
-                        var e = i + 4
-                        while (e < c.size - 3) {
-                            if (c[e].toInt() == 0 && c[e + 1].toInt() == 0 && c[e + 2].toInt() == 1) break
-                            e++
-                        }
-                        pps = c.copyOfRange(i + 3, e)
-                        ok = true
-                        Log.i("RtspSrv", "SPS=${sps?.size} PPS=${pps?.size} ok=true")
-                        return
-                    }
-                }
-                i++
-            }
-        } catch (e: Exception) { Log.e("RtspSrv", "setSP: ${e.message}", e) }
-    }
-
-    fun push(au: ByteArray, pts: Long, k: Boolean) {
-        if (!run.get()) return
-        try {
-            val ns = mutableListOf<ByteArray>()
-            var s = -1
-            var i = 0
-            while (i < au.size - 3) {
-                if (au[i].toInt() == 0 && au[i + 1].toInt() == 0 && au[i + 2].toInt() == 1) {
-                    if (s >= 0) ns.add(au.copyOfRange(s, i))
-                    s = i + 3
-                    i += 3
-                } else {
-                    i++
-                }
-            }
-            if (s >= 0 && s < au.size) ns.add(au.copyOfRange(s, au.size))
-            // Snapshot to avoid CME if a client disconnects mid-iteration
-            val snapshot = cli.values.toList()
-            for (c in snapshot) {
-                try { c.send(ns, pts, k) } catch (e: Exception) { Log.w("RtspSrv", "push to client: ${e.message}") }
-            }
-        } catch (e: Exception) { Log.e("RtspSrv", "push: ${e.message}", e) }
-    }
-
-    private fun al() {
-        val s: ServerSocket
-        try { s = ServerSocket(PORT) } catch (e: Exception) { Log.e("RtspSrv", "ServerSocket: ${e.message}"); return }
-        ss = s
-        Log.i("RtspSrv", "RTSP listening on $PORT")
-        while (run.get()) {
-            val c: Socket
-            try { c = s.accept() } catch (e: Exception) { break }
-            thread(name = "RtspCli", isDaemon = true) {
-                try { hc(c) } catch (e: Exception) { Log.e("RtspSrv", "client thread: ${e.javaClass.simpleName}: ${e.message}", e) }
-            }
+            serverSocket?.close()
+        } catch (_: Throwable) {
         }
+        clients.values.toList().forEach { it.close() }
+        clients.clear()
     }
 
-    private fun hc(s: Socket) {
+    fun resetCodecConfig() {
+        sps = null
+        pps = null
+        ok = false
+    }
+
+    fun setSP(codecConfig: ByteArray) {
         try {
-            s.soTimeout = 60000
-            val inp = BufferedReader(InputStreamReader(s.getInputStream()))
-            val out = s.getOutputStream()
-            val cs = CS(s, out)
-            try {
-                while (run.get() && !s.isClosed) {
-                    val l: String?
-                    try { l = inp.readLine() } catch (e: Exception) { break }
-                    if (l == null) break
-                    if (l.isBlank()) continue
-                    val p = l.split(" ", limit = 3)
-                    if (p.size < 2) continue
-                    val m = p[0]
-                    val c = p[1]
-                    val u = p.getOrNull(2) ?: "/live"
-                    Log.i("RtspSrv", "← $m $c $u")
-                    try {
-                        when (m) {
-                            "OPTIONS" -> sr(out, c, "200 OK", mapOf(
-                                "CSeq" to c,
-                                "Public" to "OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN",
-                                "Server" to "CamRTSP/1.0"
-                            ), null)
-                            "DESCRIBE" -> {
-                                if (!ok) {
-                                    sr(out, c, "503", mapOf("CSeq" to c), null)
-                                    continue
-                                }
-                                sr(out, c, "200 OK", mapOf(
-                                    "CSeq" to c,
-                                    "Content-Type" to "application/sdp",
-                                    "Server" to "CamRTSP/1.0"
-                                ), bsp())
-                            }
-                            "SETUP" -> {
-                                val id = Random.nextInt(0x7FFFFFFF).toString()
-                                cs.sid = id
-                                sr(out, c, "200 OK", mapOf(
-                                    "CSeq" to c,
-                                    "Session" to "$id;timeout=60",
-                                    "Transport" to "RTP/AVP/TCP;interleaved=0-1",
-                                    "Server" to "CamRTSP/1.0"
-                                ), null)
-                                cli[id] = cs
-                            }
-                            "PLAY" -> {
-                                cs.playing = true
-                                sr(out, c, "200 OK", mapOf(
-                                    "CSeq" to c,
-                                    "Session" to (cs.sid ?: "0"),
-                                    "RTP-Info" to "url=$u;seq=0;rtptime=0",
-                                    "Server" to "CamRTSP/1.0"
-                                ), null)
-                            }
-                            "TEARDOWN" -> {
-                                sr(out, c, "200 OK", mapOf(
-                                    "CSeq" to c,
-                                    "Session" to (cs.sid ?: "0"),
-                                    "Server" to "CamRTSP/1.0"
-                                ), null)
-                                cs.close()
-                                cli.remove(cs.sid)
-                            }
-                            else -> sr(out, c, "501", mapOf("CSeq" to c), null)
-                        }
-                    } catch (e: Exception) {
-                        Log.w("RtspSrv", "handle $m: ${e.javaClass.simpleName}: ${e.message}")
-                    }
+            val nals = splitAnnexB(codecConfig)
+            for (nal in nals) {
+                if (nal.isEmpty()) continue
+                when (nal[0].toInt() and 0x1F) {
+                    7 -> sps = nal.copyOf()
+                    8 -> pps = nal.copyOf()
                 }
-            } finally {
-                try { cs.close() } catch (_: Throwable) {}
-                try { cli.remove(cs.sid) } catch (_: Throwable) {}
+            }
+            if (sps != null && pps != null) {
+                ok = true
+                Log.i("RtspSrv", "SPS=${sps?.size} PPS=${pps?.size} ok=true")
             }
         } catch (e: Exception) {
-            Log.e("RtspSrv", "client handler: ${e.javaClass.simpleName}: ${e.message}", e)
+            Log.e("RtspSrv", "setSP: ${e.message}", e)
         }
     }
 
-    private fun sr(o: OutputStream, c: String, st: String, h: Map<String, String>, b: String?) {
+    fun push(accessUnit: ByteArray, ptsUs: Long, keyFrame: Boolean) {
+        if (!running.get()) return
         try {
-            val sb = StringBuilder()
-            sb.append("RTSP/1.0 ").append(st).append("\r\n")
-            h.forEach { (k, v) -> sb.append(k).append(": ").append(v).append("\r\n") }
-            if (b != null) sb.append("Content-Length: ").append(b.length).append("\r\n")
-            sb.append("\r\n")
-            if (b != null) sb.append(b)
-            o.write(sb.toString().toByteArray())
-            o.flush()
-            Log.i("RtspSrv", "→ RTSP/1.0 $st [CSeq=$c]")
+            val nals = splitAnnexB(accessUnit).filter { it.isNotEmpty() }
+            if (nals.isEmpty()) return
+
+            val snapshot = clients.values.toList()
+            for (client in snapshot) {
+                try {
+                    client.send(nals, ptsUs)
+                } catch (e: Exception) {
+                    Log.w("RtspSrv", "push to client: ${e.message}")
+                }
+            }
+        } catch (e: Exception) {
+            Log.e("RtspSrv", "push: ${e.message}", e)
+        }
+    }
+
+    private fun acceptLoop() {
+        val socket = try {
+            ServerSocket(PORT)
+        } catch (e: Exception) {
+            Log.e("RtspSrv", "ServerSocket: ${e.message}")
+            return
+        }
+        serverSocket = socket
+        Log.i("RtspSrv", "RTSP listening on $PORT")
+
+        while (running.get()) {
+            val client = try {
+                socket.accept()
+            } catch (_: Exception) {
+                break
+            }
+            thread(name = "RtspCli", isDaemon = true) {
+                try {
+                    handleClient(client)
+                } catch (e: Exception) {
+                    Log.e("RtspSrv", "client thread: ${e.javaClass.simpleName}: ${e.message}", e)
+                }
+            }
+        }
+    }
+
+    private fun handleClient(socket: Socket) {
+        socket.soTimeout = 60_000
+        val input = BufferedReader(InputStreamReader(socket.getInputStream(), StandardCharsets.US_ASCII))
+        val output = socket.getOutputStream()
+        val session = ClientSession(socket, output)
+
+        try {
+            while (running.get() && !socket.isClosed) {
+                val request = readRequest(input) ?: break
+                Log.i("RtspSrv", "<- ${request.method} ${request.uri} ${request.version}")
+
+                val cSeq = request.header("cseq") ?: "0"
+                val commonHeaders = linkedMapOf("CSeq" to cSeq)
+                var closeAfterResponse = false
+
+                when (request.method.uppercase(Locale.US)) {
+                    "OPTIONS" -> sendResponse(
+                        output,
+                        "200 OK",
+                        commonHeaders + mapOf("Public" to "OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN"),
+                        null
+                    )
+
+                    "DESCRIBE" -> {
+                        if (!ok) {
+                            sendResponse(output, "503 Service Unavailable", commonHeaders, null)
+                        } else {
+                            sendResponse(
+                                output,
+                                "200 OK",
+                                commonHeaders + mapOf(
+                                    "Content-Type" to "application/sdp",
+                                    "Content-Base" to request.uri.ensureTrailingSlash()
+                                ),
+                                buildSdp()
+                            )
+                        }
+                    }
+
+                    "SETUP" -> {
+                        val transport = request.header("transport") ?: ""
+                        if (!transport.contains("RTP/AVP/TCP", ignoreCase = true)) {
+                            sendResponse(output, "461 Unsupported Transport", commonHeaders, null)
+                        } else {
+                            val interleaved = parseInterleavedChannels(transport)
+                            session.rtpChannel = interleaved.first
+                            session.rtcpChannel = interleaved.second
+                            if (session.sessionId == null) {
+                                session.sessionId = Random.nextInt(1, Int.MAX_VALUE).toString()
+                            }
+                            clients[session.sessionId!!] = session
+                            sendResponse(
+                                output,
+                                "200 OK",
+                                commonHeaders + mapOf(
+                                    "Session" to "${session.sessionId};timeout=60",
+                                    "Transport" to "RTP/AVP/TCP;unicast;interleaved=${session.rtpChannel}-${session.rtcpChannel}"
+                                ),
+                                null
+                            )
+                        }
+                    }
+
+                    "PLAY" -> {
+                        val requestedSession = parseSessionHeader(request.header("session")) ?: session.sessionId
+                        if (requestedSession == null || requestedSession != session.sessionId) {
+                            sendResponse(output, "454 Session Not Found", commonHeaders, null)
+                        } else {
+                            session.playing = true
+                            sendResponse(
+                                output,
+                                "200 OK",
+                                commonHeaders + mapOf(
+                                    "Session" to requestedSession,
+                                    "Range" to "npt=0.000-",
+                                    "RTP-Info" to "url=${request.uri};seq=${session.nextSequenceNumber};rtptime=0"
+                                ),
+                                null
+                            )
+                        }
+                    }
+
+                    "TEARDOWN" -> {
+                        sendResponse(
+                            output,
+                            "200 OK",
+                            commonHeaders + mapOf("Session" to (session.sessionId ?: "0")),
+                            null
+                        )
+                        closeAfterResponse = true
+                    }
+
+                    else -> sendResponse(output, "501 Not Implemented", commonHeaders, null)
+                }
+
+                if (closeAfterResponse) break
+            }
+        } finally {
+            session.sessionId?.let { clients.remove(it) }
+            session.close()
+        }
+    }
+
+    private fun readRequest(input: BufferedReader): RtspRequest? {
+        var requestLine: String?
+        do {
+            requestLine = input.readLine()
+        } while (requestLine != null && requestLine.isBlank())
+
+        val firstLine = requestLine ?: return null
+        val parts = firstLine.trim().split(Regex("\\s+"), limit = 3)
+        if (parts.size != 3) return null
+
+        val headers = linkedMapOf<String, String>()
+        while (true) {
+            val line = input.readLine() ?: return null
+            if (line.isBlank()) break
+            val colon = line.indexOf(':')
+            if (colon <= 0) continue
+            val name = line.substring(0, colon).trim().lowercase(Locale.US)
+            val value = line.substring(colon + 1).trim()
+            headers[name] = value
+        }
+
+        return RtspRequest(parts[0], parts[1], parts[2], headers)
+    }
+
+    private fun sendResponse(
+        output: OutputStream,
+        status: String,
+        headers: Map<String, String>,
+        body: String?
+    ) {
+        try {
+            val bodyBytes = body?.toByteArray(StandardCharsets.UTF_8)
+            val responseHeaders = linkedMapOf<String, String>()
+            responseHeaders["Server"] = SERVER_NAME
+            responseHeaders.putAll(headers)
+            if (bodyBytes != null) responseHeaders["Content-Length"] = bodyBytes.size.toString()
+
+            val headerText = buildString {
+                append("RTSP/1.0 ").append(status).append("\r\n")
+                responseHeaders.forEach { (name, value) -> append(name).append(": ").append(value).append("\r\n") }
+                append("\r\n")
+            }
+            output.write(headerText.toByteArray(StandardCharsets.US_ASCII))
+            if (bodyBytes != null) output.write(bodyBytes)
+            output.flush()
+            Log.i("RtspSrv", "-> RTSP/1.0 $status [CSeq=${headers["CSeq"] ?: "0"}]")
         } catch (e: Exception) {
             Log.w("RtspSrv", "send RTSP: ${e.message}")
         }
     }
 
-    private fun bsp(): String {
-        return try {
-            val spsB = sps ?: return ""
-            val ppsB = pps ?: return ""
-            val sb64 = Base64.encodeToString(spsB, Base64.NO_WRAP)
-            val pb64 = Base64.encodeToString(ppsB, Base64.NO_WRAP)
-            val pl = String.format("%02X%02X%02X", spsB[1].toInt() and 0xFF, spsB[2].toInt() and 0xFF, spsB[3].toInt() and 0xFF)
-            "v=0\r\n" +
-                "o=- 0 0 IN IP4 127.0.0.1\r\n" +
-                "s=CamRTSP\r\n" +
-                "c=IN IP4 0.0.0.0\r\n" +
-                "t=0 0\r\n" +
-                "m=video 0 TCP/RTP/AVP 96\r\n" +
-                "a=rtpmap:96 H264/90000\r\n" +
-                "a=fmtp:96 profile-level-id=$pl;sprop-parameter-sets=$sb64,$pb64;packetization-mode=1\r\n" +
-                "a=control:track1\r\n" +
-                "a=framerate:$fr\r\n"
-        } catch (e: Exception) {
-            Log.e("RtspSrv", "bsp: ${e.message}", e); ""
+    private fun buildSdp(): String {
+        val spsBytes = sps ?: return ""
+        val ppsBytes = pps ?: return ""
+        val spsB64 = Base64.encodeToString(spsBytes, Base64.NO_WRAP)
+        val ppsB64 = Base64.encodeToString(ppsBytes, Base64.NO_WRAP)
+        val profileLevelId = if (spsBytes.size >= 4) {
+            String.format(
+                Locale.US,
+                "%02X%02X%02X",
+                spsBytes[1].toInt() and 0xFF,
+                spsBytes[2].toInt() and 0xFF,
+                spsBytes[3].toInt() and 0xFF
+            )
+        } else {
+            "42E01F"
+        }
+
+        return "v=0\r\n" +
+            "o=- 0 0 IN IP4 127.0.0.1\r\n" +
+            "s=CamRTSP\r\n" +
+            "c=IN IP4 0.0.0.0\r\n" +
+            "t=0 0\r\n" +
+            "a=control:*\r\n" +
+            "m=video 0 TCP/RTP/AVP 96\r\n" +
+            "a=rtpmap:96 H264/$clockRate\r\n" +
+            "a=fmtp:96 profile-level-id=$profileLevelId;sprop-parameter-sets=$spsB64,$ppsB64;packetization-mode=1\r\n" +
+            "a=control:trackID=0\r\n" +
+            "a=framerate:$frameRate\r\n" +
+            "a=x-dimensions:${width},${height}\r\n"
+    }
+
+    private fun parseInterleavedChannels(transport: String): Pair<Int, Int> {
+        val match = Regex("interleaved=(\\d+)-(\\d+)", RegexOption.IGNORE_CASE).find(transport)
+        return if (match != null) {
+            match.groupValues[1].toInt() to match.groupValues[2].toInt()
+        } else {
+            0 to 1
         }
     }
+
+    private fun parseSessionHeader(value: String?): String? = value
+        ?.substringBefore(';')
+        ?.trim()
+        ?.takeIf { it.isNotEmpty() }
+
+    private fun String.ensureTrailingSlash(): String = if (endsWith('/')) this else "$this/"
+
+    private data class RtspRequest(
+        val method: String,
+        val uri: String,
+        val version: String,
+        val headers: Map<String, String>
+    ) {
+        fun header(name: String): String? = headers[name.lowercase(Locale.US)]
+    }
+
+    private fun splitAnnexB(data: ByteArray): List<ByteArray> {
+        if (data.isEmpty()) return emptyList()
+        val firstStart = findStartCode(data, 0)
+        if (firstStart < 0) return listOf(data.copyOf())
+
+        val nals = ArrayList<ByteArray>()
+        var start = firstStart
+        while (start >= 0 && start < data.size) {
+            val nalStart = start + startCodeLength(data, start)
+            val nextStart = findStartCode(data, nalStart)
+            val nalEnd = if (nextStart >= 0) nextStart else data.size
+            if (nalEnd > nalStart) nals.add(data.copyOfRange(nalStart, nalEnd))
+            if (nextStart < 0) break
+            start = nextStart
+        }
+        return nals
+    }
+
+    private fun findStartCode(data: ByteArray, from: Int): Int {
+        var i = from.coerceAtLeast(0)
+        while (i <= data.size - 3) {
+            if (data[i].toInt() == 0 && data[i + 1].toInt() == 0) {
+                if (data[i + 2].toInt() == 1) return i
+                if (i <= data.size - 4 && data[i + 2].toInt() == 0 && data[i + 3].toInt() == 1) return i
+            }
+            i++
+        }
+        return -1
+    }
+
+    private fun startCodeLength(data: ByteArray, index: Int): Int =
+        if (index <= data.size - 4 && data[index + 2].toInt() == 0 && data[index + 3].toInt() == 1) 4 else 3
 }
 
-class CS(val sock: Socket, private val out: OutputStream) {
-    @Volatile var sid: String? = null
-    @Volatile var cseq: String? = null
+private class ClientSession(
+    private val socket: Socket,
+    private val output: OutputStream
+) {
+    @Volatile var sessionId: String? = null
+    @Volatile var playing: Boolean = false
+    @Volatile var rtpChannel: Int = 0
+    @Volatile var rtcpChannel: Int = 1
 
-    @Volatile
-    var playing = false
-
-    private var seq: Int = Random.nextInt(0, 0xFFFF)
+    private var sequenceNumber: Int = Random.nextInt(0, 0x10000)
     private val ssrc: Int = Random.nextInt()
-    private val lk = Any()
+    private val lock = Any()
 
-    fun send(ns: List<ByteArray>, pts: Long, k: Boolean) {
-        if (!playing) return
-        val ts = pts * 90L
+    val nextSequenceNumber: Int
+        get() = sequenceNumber and 0xFFFF
+
+    fun send(nals: List<ByteArray>, ptsUs: Long) {
+        if (!playing || nals.isEmpty()) return
+        val timestamp = (ptsUs * 90_000L / 1_000_000L) and 0xFFFF_FFFFL
         try {
-            synchronized(lk) {
-                for (n in ns) {
-                    if (n.isEmpty()) continue
-                    val t = n[0].toInt() and 0x1F
-                    if (n.size <= 1400) s1(n, ts) else fa(n, ts, t)
+            synchronized(lock) {
+                nals.forEachIndexed { index, nal ->
+                    if (nal.isEmpty()) return@forEachIndexed
+                    val marker = index == nals.lastIndex
+                    writeNalUnit(nal, timestamp, marker)
                 }
             }
         } catch (e: Exception) {
@@ -258,73 +402,77 @@ class CS(val sock: Socket, private val out: OutputStream) {
         }
     }
 
-    private fun s1(n: ByteArray, ts: Long) {
-        val p = ByteArray(12 + n.size)
-        p[0] = 0x80.toByte()
-        p[1] = 96.toByte()
-        p[2] = ((seq shr 8) and 0xFF).toByte()
-        p[3] = (seq and 0xFF).toByte()
-        seq = (seq + 1) and 0xFFFF
-        p[4] = ((ts shr 24) and 0xFF).toByte()
-        p[5] = ((ts shr 16) and 0xFF).toByte()
-        p[6] = ((ts shr 8) and 0xFF).toByte()
-        p[7] = (ts and 0xFF).toByte()
-        p[8] = ((ssrc shr 24) and 0xFF).toByte()
-        p[9] = ((ssrc shr 16) and 0xFF).toByte()
-        p[10] = ((ssrc shr 8) and 0xFF).toByte()
-        p[11] = (ssrc and 0xFF).toByte()
-        System.arraycopy(n, 0, p, 12, n.size)
-        si(p)
-    }
-
-    private fun fa(n: ByteArray, ts: Long, t: Int) {
-        val fi = 0x60 or (n[0].toInt() and 0x80)
-        var o = 1
-        var f = true
-        while (o < n.size) {
-            val ch = minOf(1400, n.size - o)
-            val lst = (o + ch) >= n.size
-            val p = ByteArray(12 + 2 + ch)
-            p[0] = 0x80.toByte()
-            p[1] = 96.toByte()
-            p[2] = ((seq shr 8) and 0xFF).toByte()
-            p[3] = (seq and 0xFF).toByte()
-            seq = (seq + 1) and 0xFFFF
-            p[4] = ((ts shr 24) and 0xFF).toByte()
-            p[5] = ((ts shr 16) and 0xFF).toByte()
-            p[6] = ((ts shr 8) and 0xFF).toByte()
-            p[7] = (ts and 0xFF).toByte()
-            p[8] = ((ssrc shr 24) and 0xFF).toByte()
-            p[9] = ((ssrc shr 16) and 0xFF).toByte()
-            p[10] = ((ssrc shr 8) and 0xFF).toByte()
-            p[11] = (ssrc and 0xFF).toByte()
-            p[12] = fi.toByte()
-            p[13] = (if (f) 0x80 or t else if (lst) 0x40 or t else t).toByte()
-            System.arraycopy(n, o, p, 14, ch)
-            si(p)
-            f = false
-            o += ch
+    private fun writeNalUnit(nal: ByteArray, timestamp: Long, marker: Boolean) {
+        if (nal.size <= MAX_RTP_PAYLOAD) {
+            val packet = ByteArray(RTP_HEADER_SIZE + nal.size)
+            writeRtpHeader(packet, timestamp, marker)
+            System.arraycopy(nal, 0, packet, RTP_HEADER_SIZE, nal.size)
+            writeInterleaved(packet)
+        } else {
+            writeFuA(nal, timestamp, marker)
         }
     }
 
-    private fun si(p: ByteArray) {
-        try {
-            synchronized(lk) {
-                out.write(0x24)
-                out.write(0x00)
-                out.write(((p.size shr 8) and 0xFF))
-                out.write((p.size and 0xFF))
-                out.write(p)
-                out.flush()
-            }
-        } catch (e: Exception) {
-            Log.w("RtspSrv", "RTP write: ${e.message}")
-            playing = false
+    private fun writeFuA(nal: ByteArray, timestamp: Long, marker: Boolean) {
+        val nalHeader = nal[0].toInt() and 0xFF
+        val nalType = nalHeader and 0x1F
+        val fuIndicator = (nalHeader and 0xE0) or 28
+        var offset = 1
+        var first = true
+        val maxChunk = MAX_RTP_PAYLOAD - 2
+
+        while (offset < nal.size) {
+            val chunkSize = minOf(maxChunk, nal.size - offset)
+            val last = offset + chunkSize >= nal.size
+            val packet = ByteArray(RTP_HEADER_SIZE + 2 + chunkSize)
+            writeRtpHeader(packet, timestamp, marker && last)
+            packet[RTP_HEADER_SIZE] = fuIndicator.toByte()
+            packet[RTP_HEADER_SIZE + 1] = ((if (first) 0x80 else 0) or (if (last) 0x40 else 0) or nalType).toByte()
+            System.arraycopy(nal, offset, packet, RTP_HEADER_SIZE + 2, chunkSize)
+            writeInterleaved(packet)
+            first = false
+            offset += chunkSize
         }
+    }
+
+    private fun writeRtpHeader(packet: ByteArray, timestamp: Long, marker: Boolean) {
+        packet[0] = 0x80.toByte()
+        packet[1] = ((if (marker) 0x80 else 0) or PAYLOAD_TYPE).toByte()
+        packet[2] = ((sequenceNumber shr 8) and 0xFF).toByte()
+        packet[3] = (sequenceNumber and 0xFF).toByte()
+        sequenceNumber = (sequenceNumber + 1) and 0xFFFF
+
+        packet[4] = ((timestamp shr 24) and 0xFF).toByte()
+        packet[5] = ((timestamp shr 16) and 0xFF).toByte()
+        packet[6] = ((timestamp shr 8) and 0xFF).toByte()
+        packet[7] = (timestamp and 0xFF).toByte()
+        packet[8] = ((ssrc shr 24) and 0xFF).toByte()
+        packet[9] = ((ssrc shr 16) and 0xFF).toByte()
+        packet[10] = ((ssrc shr 8) and 0xFF).toByte()
+        packet[11] = (ssrc and 0xFF).toByte()
+    }
+
+    private fun writeInterleaved(packet: ByteArray) {
+        output.write(INTERLEAVED_MAGIC)
+        output.write(rtpChannel and 0xFF)
+        output.write((packet.size shr 8) and 0xFF)
+        output.write(packet.size and 0xFF)
+        output.write(packet)
+        output.flush()
     }
 
     fun close() {
         playing = false
-        try { sock.close() } catch (_: Throwable) {}
+        try {
+            socket.close()
+        } catch (_: Throwable) {
+        }
+    }
+
+    companion object {
+        private const val RTP_HEADER_SIZE = 12
+        private const val PAYLOAD_TYPE = 96
+        private const val MAX_RTP_PAYLOAD = 1400
+        private const val INTERLEAVED_MAGIC = 0x24
     }
 }

@@ -1,106 +1,88 @@
-# CamRTSP — телефон как RTSP-камера
+# CamRTSP — Android phone as an RTSP camera
 
-Android-приложение: тыловая камера телефона → Wi-Fi → `rtsp://IP:8554/live` (H.264 / RTP-over-TCP).
-Подключай VLC, видеорегистраторы (Hikvision/iVMS, Dahua, Synology Surveillance Station) или
-любой RTSP-клиент.
+Android app: rear camera -> Wi-Fi -> `rtsp://IP:8554/live` (H.264 / RTP-over-TCP). Use VLC, ffplay, NVRs, or any RTSP client that supports interleaved TCP transport.
 
-## Возможности
+## Features
 
-- H.264 энкодер, целевое разрешение 1280×720 @ 25 fps, 2.5 Mbps
-- **Авто-ресайз**: если устройство игнорирует `setTargetResolution` (Xiaomi и т.п. отдают 1088×1088),
-  энкодер пересоздаётся на реальный размер первого кадра
-- Цветовая схема — NV12 (YUV420 semi-planar), самый совместимый формат для Android H.264
-- Транспорт **RTP-over-TCP (interleaved)** — проходит через NAT/файрволы, работает с регистраторами
-- Несколько одновременных зрителей (RTSP-сессии)
-- Foreground service + persistent notification — стримит при погасшем экране
-- Не убивается при свайпе из recents (`onTaskRemoved`)
-- `packetization-mode=1` в SDP + правильный FU-A fragmentation для больших NALU
+- H.264 encoder, target resolution 1280x720 @ 25 fps, 2.5 Mbps.
+- Auto-resize: if the camera returns a different actual frame size, the encoder is re-created for the real size.
+- NV12 input to Android H.264 encoder.
+- RTP-over-TCP interleaved transport.
+- Multiple simultaneous RTSP sessions.
+- Foreground service with persistent notification.
+- File-backed in-app log with crash reporting.
 
-## Отладка прямо в приложении
+## Important fixes in this version
 
-Главный экран:
-- IP и RTSP-URL
-- Кнопки **START / STOP**
-- Кнопка **Copy log to clipboard** + длинный тап на тексте лога
-- Живой лог снизу (INFO — голубой, WARN — жёлтый, ERROR — красный) с таймстампами
+- RTSP requests are parsed as request line plus headers; `CSeq`, `Session`, and `Transport` are no longer confused with URI tokens.
+- RTSP `SETUP` validates TCP interleaved transport and returns a usable `Session`.
+- RTP H.264 timestamp uses the correct 90 kHz clock: `ptsUs * 90000 / 1000000`.
+- RTP marker bit is set on the last RTP packet of each access unit.
+- FU-A fragmentation preserves the original NAL F/NRI bits and uses a valid FU indicator.
+- MediaCodec output buffers are read from `BufferInfo.offset` for exactly `BufferInfo.size` bytes.
+- SPS/PPS are collected from both codec-config buffers and output-format CSD buffers.
+- Microphone permission and microphone foreground-service type are removed because the app streams video only.
+- Service running state uses an atomic flag; encoder drain state is separate from service lifecycle state.
+- UI log callback is detached on pause/destroy to avoid leaking Activity instances.
+- Service logs are persisted once and rotated at 512 KB.
+- The crash receiver is registered as non-exported.
+- Local IPv4 detection uses the active Android network first, then falls back to all non-loopback interfaces.
 
-**Все логи** параллельно пишутся в `filesDir/camrtsp.log` (внутренняя память) — переживают
-смерть процесса. При перезапуске Activity подгружает последние 200 строк.
+## Debugging in the app
 
-**Глобальный обработчик крэшей** (`Thread.setDefaultUncaughtExceptionHandler` в сервисе):
-ловит необработанные исключения во **всех** потоках, пишет стек-трейс в файл и шлёт
-broadcast `com.camrtsp.app.CRASH` — Activity показывает FATAL прямо в UI красным.
-Скопируй лог через «Copy log to clipboard» — в нём будет видна причина, даже если приложение
-упало.
+The main screen shows:
 
-## CI: авто-сборка подписанного APK
+- Status and RTSP URL.
+- START / STOP controls.
+- Copy log to clipboard.
+- Live colored log output.
 
-`.github/workflows/build.yml` запускается на каждый push в `main` и тег `v*`:
+Logs are written to `filesDir/camrtsp.log`. When the file exceeds 512 KB it is rotated to `camrtsp.log.1`.
 
-1. Checkout → JDK 17 → Android SDK 34
-2. **Генерирует keystore** `app/keystore/release-debug.keystore` (RSA 2048, 10000 дней,
-   пароль `android`, alias `camrtsp`)
-3. `gradle assembleRelease` — собирает подписанный APK
-4. `apksigner verify --verbose` — проверяет подпись
-5. На теге `v*` — публикует в GitHub Release
-6. На push в `main` — отдаёт APK артефактом `CamRTSP-signed`
+## Local build
 
-Keystore добавляется в `.gitignore`, генерируется заново в каждом CI-запуске.
-APK подписан **debug-grade** сертификатом (Android принимает, но Google Play — нет).
-Этого хватает для установки через боковую загрузку и для регистраторов, которые
-не проверяют источник сертификата.
-
-## Сборка локально
+This repository does not include a Gradle wrapper JAR. Install Gradle 8.5 locally, or open the project in Android Studio and let it use an installed Gradle distribution.
 
 ```bash
-./gradlew assembleRelease   # подписанный debug-grade APK
-./gradlew assembleDebug     # unsigned debug APK
+gradle assembleRelease   # signed with generated/debug signing config if present; otherwise debug signing
+gradle assembleDebug
 ```
 
-Минимальный Android SDK — 24 (Android 7.0), target — 34 (Android 14).
+For command-line builds, create `local.properties` from `local.properties.example` and point `sdk.dir` to your Android SDK.
 
-## Использование
+Minimum Android SDK: 24 (Android 7.0). Target SDK: 34 (Android 14).
 
-1. Скачай `CamRTSP-signed.apk` со страницы Actions последнего успешного билда
-   (или из Releases, если есть тег `v*`)
-2. Установи на телефон: разреши «Установка из неизвестных источников»
-3. Подключи телефон к той же Wi-Fi, что и регистратор/комп с VLC
-4. Запусти приложение, дай разрешения (камера, микрофон, уведомления)
-5. Нажми **START** — увидишь `rtsp://192.168.x.x:8554/live`
-6. Подключайся:
-   - **VLC**: Медиа → Открыть URL → вставить
-   - **Регистратор**: Custom RTSP, транспорт **TCP**
-   - **ffplay**: `ffplay -rtsp_transport tcp rtsp://IP:8554/live`
+## Usage
 
-## Архитектура
+1. Install the APK on a phone.
+2. Grant camera permission and notification permission on Android 13+.
+3. Connect the phone and client/NVR/VLC to the same network.
+4. Press START.
+5. Connect to the shown URL, for example:
 
+```bash
+ffplay -rtsp_transport tcp rtsp://IP:8554/live
 ```
+
+## Architecture
+
+```text
 MainActivity (UI + log view)
-   └─ start/stop → RtspServerService (LifecycleService, foreground)
-         ├─ RtspServer (ServerSocket :8554, per-client CS)
-         ├─ MediaCodec H.264 encoder (1280×720, NV12, 2.5 Mbps)
-         ├─ CameraX ImageAnalysis (YUV_420_888) → YUV-to-NV12 → encoder
-         └─ Drain thread: encoder output → RtspServer.push (per-NAL RTP)
+   -> RtspServerService (LifecycleService, foreground)
+        -> RtspServer (ServerSocket :8554, per-client sessions)
+        -> MediaCodec H.264 encoder
+        -> CameraX ImageAnalysis (YUV_420_888 -> NV12 -> encoder)
+        -> Drain thread (encoder output -> RTSP/RTP)
 ```
 
-### Ключевые файлы
+## Known limitations
 
-- `app/src/main/java/com/camrtsp/app/MainActivity.kt` — UI + log viewer
-- `app/src/main/java/com/camrtsp/app/RtspServerService.kt` — оркестратор
-  (camera bind, encoder lifecycle, drain loop, crash handler)
-- `app/src/main/java/com/camrtsp/app/RtspServer.kt` — RTSP/RTP сервер на голых сокетах
-- `app/src/main/res/layout/activity_main.xml` — UI layout
-- `.github/workflows/build.yml` — CI
+- No audio stream.
+- No RTSP authentication or network allowlist in this version.
+- Only RTP-over-TCP interleaved transport is implemented.
+- Encoder behavior depends on the device chipset and vendor camera stack.
+- Release signing is debug-grade unless you provide your own keystore.
 
-## Известные ограничения
-
-- Аудио не транскодируется (в `ImageAnalysis` только видео). Микрофон запрашивается для
-  будущей поддержки
-- Сертификат debug-grade: Google Play не примет, но боковая установка и регистраторы работают
-- Кодек зависит от устройства — некоторые старые чипсеты могут не иметь нужного H.264 encoder
-- MTU: NALU фрагментируются по 1400 байт (FU-A) — для гигабитных сетей хватает,
-  для очень медленного Wi-Fi может лагать
-
-## Лицензия
+## License
 
 MIT
