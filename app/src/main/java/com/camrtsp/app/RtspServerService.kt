@@ -314,7 +314,7 @@ class RtspServerService : LifecycleService() {
                     if (idx < 0) attempts++
                 }
                 if (idx < 0) return
-                val ib: ByteBuffer? = try { cd.getInputBuffer(idx) } catch (e: Exception) {
+                val ib: ByteBuffer = try { cd.getInputBuffer(idx) } catch (e: Exception) {
                     log("getInputBuffer threw: ${e.message}", "E"); null
                 } ?: return
                 val cap = ib.capacity()
